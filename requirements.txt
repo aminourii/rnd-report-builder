@@ -1,0 +1,14 @@
+pyinstaller
+pillow
+os
+sys
+csv
+json
+datetime
+subprocess
+tempfile
+uuid
+dataclasses
+typing
+tkinter
+

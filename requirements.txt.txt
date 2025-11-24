@@ -1,5 +1,0 @@
-@'
-pyinstaller
-pillow
-# add any other libraries you import in RGGP7.py
-'@ | Out-File -Encoding utf8 "requirements.txt"
