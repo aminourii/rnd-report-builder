@@ -978,9 +978,24 @@ class ReportApp(tk.Tk):
         style_cb.bind("<<ComboboxSelected>>", lambda _e: self._update_trial_preview())
         self._update_trial_preview()
 
-        # 2.4. Results
+        # 2.4. Results  (UPDATED with “ii”)
         t24 = ttk.Frame(sub, padding=8)
         sub.add(t24, text="2.4. Results")
+
+        # --- “ii” (info icon) with required guidance for section 2.4 ---
+        top24 = ttk.Frame(t24)
+        top24.pack(fill="x", pady=(0, 6))
+        ttk.Label(top24, text="2.4. Results", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+
+        info_icon(
+            top24,
+            "Please ensure that this section includes all of the following items:\n\n"
+            "• A full ambient and accelerated shelf-life evaluation, including test conditions and sampling intervals.\n"
+            "• Freezing point data (static and non-static, if applicable), along with freeze/thaw behavior and reconstitution outcomes.\n"
+            "• Supporting visuals, such as before-and-after images from the temperature-stability tests.\n"
+            "• All relevant calculations."
+        )
+
         self.results_container = ttk.Frame(t24)
         self.results_container.pack(fill="both", expand=True)
         self._results: List[ResultItem] = []
