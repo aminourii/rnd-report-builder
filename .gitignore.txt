@@ -1,0 +1,37 @@
+@'
+# ---- OS / system
+Thumbs.db
+.DS_Store
+*.lnk
+
+# ---- Windows user/profile stuff (avoid permission issues)
+Application Data/
+AppData/
+*/AppData/*
+OneDriveTemp/
+
+# ---- Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+*.spec
+
+# ---- VS Code
+.vscode/
+.vscode-test/
+
+# ---- PyInstaller / temp
+*.log
+*.tmp
+*.bak
+
+# ---- Misc
+~$*
+'@ | Out-File -Encoding utf8 ".gitignore"
