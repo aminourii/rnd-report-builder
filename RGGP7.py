@@ -138,6 +138,11 @@ class EmailEntry:
     correspondence: str
 
 @dataclass
+class MiscItem:
+    title: str
+    content: str
+
+@dataclass
 class ReportModel:
     # 1. General
     project_title: str = ""
@@ -159,8 +164,10 @@ class ReportModel:
     trial_docx_style: str = DOCX_TABLE_STYLES[0]
     results: List[ResultItem] = field(default_factory=list)
     conclusion: List[str] = field(default_factory=list)
+    # legacy 'miscellaneous' kept for backward load; new structured list below
     miscellaneous: str = ""
     references: List[str] = field(default_factory=list)
+    miscellaneous_items: List[MiscItem] = field(default_factory=list)
 
     # 3. Regulatory
     regulations: str = ""
@@ -428,6 +435,42 @@ class ImageManager(ttk.Frame):
             out_paths.append(out)
         return out_paths
 
+# ------------------------------ Collapsible helper ------------------------------
+class Collapsible(ttk.Frame):
+    """Collapsible section with a checkbox and disclosure arrow."""
+    def __init__(self, master, title, section_var: tk.BooleanVar, *args, **kwargs):
+        super().__init__(master, *args, **kwargs)
+        self.section_var = section_var
+        self._open = tk.BooleanVar(value=True)
+
+        hdr = ttk.Frame(self)
+        hdr.pack(fill="x", pady=(4, 2))
+
+        self.btn = ttk.Button(hdr, width=2, text="▾", command=self._toggle, takefocus=False)
+        self.btn.pack(side=tk.LEFT)
+
+        self.chk = ttk.Checkbutton(hdr, text=title, variable=self.section_var, command=self._on_section_toggle)
+        self.chk.pack(side=tk.LEFT, padx=(4, 0))
+
+        self.body = ttk.Frame(self)
+        self.body.pack(fill="both", expand=True, padx=24)
+
+    def _toggle(self):
+        self._open.set(not self._open.get())
+        self.btn.configure(text="▾" if self._open.get() else "▸")
+        if self._open.get():
+            self.body.pack(fill="both", expand=True, padx=24)
+        else:
+            self.body.forget()
+
+    def _on_section_toggle(self):
+        state = "normal" if self.section_var.get() else "disabled"
+        for child in self.body.winfo_children():
+            try:
+                child.configure(state=state)
+            except Exception:
+                pass
+
 # ------------------------------ Main App ------------------------------
 class ReportApp(tk.Tk):
     def __init__(self):
@@ -438,10 +481,27 @@ class ReportApp(tk.Tk):
         self._last_focused_widget: Optional[tk.Widget] = None
 
         self.current_file_path: Optional[str] = None
+
+        # init master include dict  >>> MOVED UP <<<
+        self.include = {}
+
         self._include_state_keys = [
-            "sec_general", "t_plain", "t_objectives", "t_methods", "t_rm", "t_ins", "t_proc",
-            "t_trial", "t_results", "t_conc", "t_misc", "t_refs",
-            "sec_reg", "sec_scale", "sec_quality", "sec_commercial"
+            # Section 1
+            "sec_general",
+            # Section 2 (container + items)
+            "sec_tech",
+            "t_plain", "t_objectives", "t_methods",
+            "t_rm", "t_ins", "t_proc", "t_trial",
+            "t_results", "t_conc", "t_refs", "t_misc",
+            # Section 3
+            "sec_reg", "reg_31", "reg_32", "reg_33",
+            # Section 4
+            "sec_scale", "s_41", "s_42", "s_43", "s_44", "s_45", "s_46",
+            # Section 5
+            "sec_quality", "q_51", "q_52", "q_53", "q_54",
+            # Section 6
+            "sec_commercial", "c_61", "c_62", "c_63", "c_64", "c_65", "c_66",
+            "c_67", "c_68", "c_69", "c_610", "c_611", "c_612",
         ]
 
         self.header_path_var = tk.StringVar(value=resource_path("assets", "Header.png"))
@@ -458,7 +518,7 @@ class ReportApp(tk.Tk):
 
         self._make_menubar()
         self._branding_bar()
-        self._build_ui()
+        self._build_ui()   # safe now, self.include exists
         self._wire_focus_tracking()
 
         self.bind_all("<Control-n>", lambda e: self._file_new())
@@ -607,13 +667,14 @@ class ReportApp(tk.Tk):
     # persistence
     def _to_dict(self) -> dict:
         r = self._collect()
-        include_state = {k: bool(self.include[k].get()) for k in self._include_state_keys}
+        include_state = {k: bool(self.include.get(k, tk.BooleanVar(value=True)).get()) for k in self._include_state_keys}
         data = {
             "report_model": {
                 **asdict(r),
                 "trial_history": [asdict(tr) for tr in r.trial_history],
                 "results": [asdict(res) for res in r.results],
                 "email_correspondence": [asdict(e) for e in r.email_correspondence],
+                "miscellaneous_items": [asdict(m) for m in r.miscellaneous_items],
             },
             "branding": {
                 "header_path": self.header_path_var.get(),
@@ -643,12 +704,17 @@ class ReportApp(tk.Tk):
             for e in rm.get("email_correspondence", []):
                 emails_in.append(e)
 
-            # Back-compat: if old 'manuf_order_text' exists, split it into steps
             mo_steps = list(rm.get("manuf_order_steps", []))
             if not mo_steps and rm.get("manuf_order_text", ""):
                 mo_steps = safe_split_lines(rm.get("manuf_order_text", ""))
 
-            # ---------------------- FIX IS HERE ----------------------
+            misc_items_in = []
+            for m in rm.get("miscellaneous_items", []):
+                misc_items_in.append(m)
+            # Back-compat: if legacy 'miscellaneous' string exists and no structured items, create one
+            if not misc_items_in and rm.get("miscellaneous", "").strip():
+                misc_items_in = [{"title": "Notes", "content": rm.get("miscellaneous", "").strip()}]
+
             r = ReportModel(
                 project_title=rm.get("project_title", ""),
                 start_date=rm.get("start_date", ""),
@@ -658,7 +724,7 @@ class ReportApp(tk.Tk):
                 researcher_name=rm.get("researcher_name", ""),
                 total_hours=rm.get("total_hours", ""),
                 plain_summary=rm.get("plain_summary", ""),
-                objectives=list(rm.get("objectives", [])),  # <- use rm, not r
+                objectives=list(rm.get("objectives", [])),
                 methods_raw_materials=list(rm.get("methods_raw_materials", [])),
                 methods_instruments=list(rm.get("methods_instruments", [])),
                 methods_procedure=list(rm.get("methods_procedure", [])),
@@ -669,12 +735,12 @@ class ReportApp(tk.Tk):
                 conclusion=list(rm.get("conclusion", [])),
                 miscellaneous=rm.get("miscellaneous", ""),
                 references=list(rm.get("references", [])),
+                miscellaneous_items=[MiscItem(**mi) for mi in misc_items_in],
 
                 regulations=rm.get("regulations", ""),
                 label_req=rm.get("label_req", ""),
                 certification_req=rm.get("certification_req", ""),
 
-                # Section 4 (with new 4.1 list)
                 manuf_order_steps=mo_steps,
                 formulation_risk_text=rm.get("formulation_risk_text",""),
                 hazards_text=rm.get("hazards_text",""),
@@ -700,7 +766,6 @@ class ReportApp(tk.Tk):
                 tds_development=rm.get("tds_development",""),
                 email_correspondence=[EmailEntry(**e) for e in emails_in],
             )
-            # ---------------------------------------------------------
 
             self._populate_from_model(r)
 
@@ -716,7 +781,10 @@ class ReportApp(tk.Tk):
 
             inc = data.get("include", {})
             for k in self._include_state_keys:
-                if k in inc: self.include[k].set(bool(inc[k]))
+                if k in inc:
+                    self.include[k] = tk.BooleanVar(value=bool(inc[k]))
+                else:
+                    self.include[k] = tk.BooleanVar(value=True)
 
             self.trial_layout_var.set(r.trial_layout)
             self.trial_style_var.set(r.trial_docx_style)
@@ -756,8 +824,13 @@ class ReportApp(tk.Tk):
         self._rebuild_results_list()
 
         self.txt_conclusion.delete("1.0","end"); self.txt_conclusion.insert("1.0","\n".join(r.conclusion))
-        self.txt_misc.delete("1.0","end"); self.txt_misc.insert("1.0", r.miscellaneous)
+
+        # references
         self.txt_refs.delete("1.0","end"); self.txt_refs.insert("1.0","\n".join(r.references))
+
+        # misc items
+        self._misc_items = list(r.miscellaneous_items)
+        self._rebuild_misc_list()
 
         # Regulatory
         self.txt_regs.delete("1.0","end"); self.txt_regs.insert("1.0", r.regulations)
@@ -818,7 +891,6 @@ class ReportApp(tk.Tk):
             if not p: return
             self.logo_path_var.set(p); self._prepare_ui_logo()
             for child in list(bar.winfo_children()):
-                # remove old image label(s)
                 if isinstance(child, ttk.Label) and getattr(child, "image", None):
                     child.destroy()
             if self._ui_logo_small:
@@ -856,22 +928,29 @@ class ReportApp(tk.Tk):
         self._watch_widget(ent)
         return var, ent
 
-    def labeled_text(self, parent, label, height=6, ii_text: Optional[str] = None):
+    def labeled_text(self, parent, label, height=6, ii_text: Optional[str] = None, ii_at_start=False):
         frame = ttk.Frame(parent); frame.pack(fill="both", pady=4, expand=True)
         top = ttk.Frame(frame); top.pack(fill="x")
-        ttk.Label(top, text=label, width=24, anchor="w").pack(side=tk.LEFT)
-        if ii_text: info_icon(top, ii_text)
+        if ii_at_start and ii_text:
+            info_icon(top, ii_text)
+            ttk.Label(top, text=label, width=30, anchor="w").pack(side=tk.LEFT, padx=(4,0))
+        else:
+            ttk.Label(top, text=label, width=24, anchor="w").pack(side=tk.LEFT)
+            if ii_text: info_icon(top, ii_text)
         txt = tk.Text(frame, height=height, wrap="word")
         txt.pack(fill="both", expand=True)
         self._watch_widget(txt)
         return txt
 
-    def plain_text_area(self, parent, height=6, ii_text: Optional[str] = None):
-        """Text area without a 'Details' label."""
+    def plain_text_area(self, parent, height=6, ii_text: Optional[str] = None, ii_at_start=False):
         frame = ttk.Frame(parent); frame.pack(fill="both", pady=4, expand=True)
+        top = ttk.Frame(frame); top.pack(fill="x")
         if ii_text:
-            top = ttk.Frame(frame); top.pack(fill="x")
-            info_icon(top, ii_text)
+            if ii_at_start:
+                info_icon(top, ii_text)
+            else:
+                info_icon(top, ii_text).pack_forget()  # not used here; just standard
+                info_icon(top, ii_text)
         txt = tk.Text(frame, height=height, wrap="word")
         txt.pack(fill="both", expand=True)
         self._watch_widget(txt)
@@ -898,19 +977,21 @@ class ReportApp(tk.Tk):
         self._tab_roots.append(outer); self._apply_ui_watermark(outer)
         sub = ttk.Notebook(outer); sub.pack(fill="both", expand=True)
 
-        # 2.1.
+        # 2.1. Plain Summary — match 2.2 style (title + ii on next line)
         t21 = ttk.Frame(sub, padding=8); sub.add(t21, text="2.1. Plain Summary")
-        self.txt_plain = self.labeled_text(
-            t21, "2.1. Plain Language Summary:", height=10,
-            ii_text="Plain-English overview of the customer's request and the problem to solve."
-        )
+        title21 = ttk.Frame(t21); title21.pack(fill="x")
+        ttk.Label(title21, text="2.1. Plain Language Summary:", width=40, anchor="w").pack(side=tk.LEFT)
+        ii21 = ttk.Frame(t21); ii21.pack(fill="x")
+        info_icon(ii21, "Plain-English overview of the customer's request and the problem to solve.")
+        self.txt_plain = tk.Text(t21, height=10, wrap="word"); self.txt_plain.pack(fill="both", expand=True)
         ChemDropdown(t21, self._target_widget).pack(anchor="w", pady=2)
 
-        # 2.2. Objectives
+        # 2.2. Objectives (ii one line below title)
         t22 = ttk.Frame(sub, padding=8); sub.add(t22, text="2.2. Objectives")
-        info_row = ttk.Frame(t22); info_row.pack(fill="x")
-        ttk.Label(info_row, text="2.2. Objectives (numbered):", width=30, anchor="w").pack(side=tk.LEFT)
-        info_icon(info_row, "List specific, actionable objectives—one per line.")
+        title22 = ttk.Frame(t22); title22.pack(fill="x")
+        ttk.Label(title22, text="2.2. Objectives (numbered):", width=40, anchor="w").pack(side=tk.LEFT)
+        ii22 = ttk.Frame(t22); ii22.pack(fill="x")
+        info_icon(ii22, "List specific, actionable objectives—one per line.")
         self._obj_container = ttk.Frame(t22); self._obj_container.pack(fill="both", expand=True, pady=(2, 0))
         self.obj_vars: List[tk.StringVar] = []; self._add_objective_row()
         btns = ttk.Frame(t22); btns.pack(anchor="w", pady=4)
@@ -978,48 +1059,53 @@ class ReportApp(tk.Tk):
         style_cb.bind("<<ComboboxSelected>>", lambda _e: self._update_trial_preview())
         self._update_trial_preview()
 
-        # 2.4. Results  (UPDATED with “ii”)
+        # 2.4. Results
         t24 = ttk.Frame(sub, padding=8)
         sub.add(t24, text="2.4. Results")
-
-        # --- “ii” (info icon) with required guidance for section 2.4 ---
-        top24 = ttk.Frame(t24)
-        top24.pack(fill="x", pady=(0, 6))
-        ttk.Label(top24, text="2.4. Results", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
-
-        info_icon(
-            top24,
-            "Please ensure that this section includes all of the following items:\n\n"
-            "• A full ambient and accelerated shelf-life evaluation, including test conditions and sampling intervals.\n"
-            "• Freezing point data (static and non-static, if applicable), along with freeze/thaw behavior and reconstitution outcomes.\n"
-            "• Supporting visuals, such as before-and-after images from the temperature-stability tests.\n"
-            "• All relevant calculations."
-        )
-
         self.results_container = ttk.Frame(t24)
         self.results_container.pack(fill="both", expand=True)
         self._results: List[ResultItem] = []
         self._rebuild_results_list()
         ttk.Button(t24, text="Add Result Item", command=self._add_result_dialog).pack(anchor="w", pady=6)
 
-        # 2.5. Conclusion
+        # 2.5. Conclusion — ii one line below
         t25 = ttk.Frame(sub, padding=8); sub.add(t25, text="2.5. Conclusion")
-        self.txt_conclusion = self.labeled_text(
-            t25, "2.5. Bullet points (one per line):", height=6,
-            ii_text="Concise, outcome-focused statements tied to objectives."
-        )
+        title25 = ttk.Frame(t25); title25.pack(fill="x")
+        ttk.Label(title25, text="2.5. Bullet points (one per line):", width=40, anchor="w").pack(side=tk.LEFT)
+        ii25 = ttk.Frame(t25); ii25.pack(fill="x")
+        info_icon(ii25, "Concise, outcome-focused statements tied to objectives.")
+        self.txt_conclusion = tk.Text(t25, height=6, wrap="word"); self.txt_conclusion.pack(fill="both", expand=True)
         ChemDropdown(t25, self._target_widget).pack(anchor="w", pady=2)
 
-        # 2.6. Miscellaneous
-        t26_misc = ttk.Frame(sub, padding=8); sub.add(t26_misc, text="2.6. Miscellaneous")
-        self.txt_misc = self.labeled_text(t26_misc, "2.6. Text:", height=6)
-        ChemDropdown(t26_misc, self._target_widget).pack(anchor="w", pady=2)
+        # 2.6. References (moved before Misc) — match 2.2 style
+        t26_ref = ttk.Frame(sub, padding=8); sub.add(t26_ref, text="2.6. References")
+        title26 = ttk.Frame(t26_ref); title26.pack(fill="x")
+        ttk.Label(title26, text="2.6. References (one per line):", width=40, anchor="w").pack(side=tk.LEFT)
+        ii26 = ttk.Frame(t26_ref); ii26.pack(fill="x")
+        info_icon(ii26, "Provide citations for all sources referenced.")
+        self.txt_refs = tk.Text(t26_ref, height=6, wrap="word"); self.txt_refs.pack(fill="both", expand=True)
+        ChemDropdown(t26_ref, self._target_widget).pack(anchor="w", pady=2)
 
-        # 2.7. References
-        t27 = ttk.Frame(sub, padding=8); sub.add(t27, text="2.7. References")
-        self.txt_refs = self.labeled_text(t27, "2.7. References (one per line):", height=6,
-                                          ii_text="Provide citations for all sources referenced.")
-        ChemDropdown(t27, self._target_widget).pack(anchor="w", pady=2)
+        # 2.7. Miscellaneous (multi entries 2.7.1, 2.7.2 …)
+        t27_misc = ttk.Frame(sub, padding=8); sub.add(t27_misc, text="2.7. Miscellaneous")
+        title27 = ttk.Frame(t27_misc); title27.pack(fill="x")
+        ttk.Label(title27, text="2.7. Miscellaneous Items:", width=40, anchor="w").pack(side=tk.LEFT)
+        ii27 = ttk.Frame(t27_misc); ii27.pack(fill="x")
+        info_icon(ii27, "Add titled notes/appendices. Titles will be numbered 2.7.1, 2.7.2, …")
+        self.misc_frame = ttk.Frame(t27_misc); self.misc_frame.pack(fill="both", expand=True, pady=(2, 0))
+
+        # list UI
+        cols_m = ("Title", )
+        self.misc_tree = ttk.Treeview(self.misc_frame, columns=cols_m, show="headings", height=6)
+        self.misc_tree.heading("Title", text="Title")
+        self.misc_tree.column("Title", width=420, stretch=True, anchor="w")
+        self.misc_tree.pack(fill="both", expand=True, pady=(0,4))
+        btnrow_m = ttk.Frame(self.misc_frame); btnrow_m.pack(fill="x")
+        ttk.Button(btnrow_m, text="Add", command=self._misc_add_dialog).pack(side=tk.LEFT)
+        ttk.Button(btnrow_m, text="Edit", command=self._misc_edit_dialog).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btnrow_m, text="Delete", command=self._misc_delete).pack(side=tk.LEFT, padx=6)
+
+        self._misc_items: List[MiscItem] = []
 
     def _tab_regulatory(self, notebook):
         tab = ttk.Frame(notebook, padding=10)
@@ -1027,25 +1113,29 @@ class ReportApp(tk.Tk):
         self._tab_roots.append(tab); self._apply_ui_watermark(tab)
 
         f1 = ttk.Labelframe(tab, text="3.1. Application regulations"); f1.pack(fill="both", expand=True, pady=4)
-        self.txt_regs = self.labeled_text(f1, "Text:", height=6,
-            ii_text="Summarize applicable EPA, FDA, USDA, NSF/ANSI, AWWA, and related requirements.")
+        # remove "Text:" label after subheading; move ii to far left
+        self.txt_regs = self.labeled_text(f1, "", height=6,
+            ii_text="Summarize applicable EPA, FDA, USDA, NSF/ANSI, AWWA, and related requirements.", ii_at_start=True)
+
         f2 = ttk.Labelframe(tab, text="3.2. Label Requirements"); f2.pack(fill="both", expand=True, pady=4)
-        self.txt_label_req = self.labeled_text(f2, "Text:", height=6, ii_text="Required statements, directions, warnings, and use instructions.")
+        self.txt_label_req = self.labeled_text(f2, "", height=6,
+            ii_text="Required statements, directions, warnings, and use instructions.", ii_at_start=True)
+
         f3 = ttk.Labelframe(tab, text="3.3. Certification Requirements"); f3.pack(fill="both", expand=True, pady=4)
-        self.txt_cert_req = self.labeled_text(f3, "Text:", height=6, ii_text="e.g., NSF/ANSI 60, OMRI, Kosher, Halal, other marks.")
+        self.txt_cert_req = self.labeled_text(f3, "", height=6,
+            ii_text="e.g., NSF/ANSI 60, OMRI, Kosher, Halal, other marks.", ii_at_start=True)
 
     def _tab_scaleup(self, notebook):
         tab = ttk.Frame(notebook, padding=10)
         notebook.add(tab, text="4. Scale Up")
         self._tab_roots.append(tab); self._apply_ui_watermark(tab)
 
-        # Two-column grid like section 6
         grid = ttk.Frame(tab)
         grid.pack(fill="both", expand=True)
         grid.columnconfigure(0, weight=1)
         grid.columnconfigure(1, weight=1)
 
-        # 4.1. Manufacturing Order (spans both columns)
+        # 4.1. Manufacturing Order
         f41 = ttk.Labelframe(grid, text="4.1. Manufacturing Order")
         f41.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=4, pady=4)
         info_row = ttk.Frame(f41); info_row.pack(fill="x")
@@ -1061,7 +1151,7 @@ class ReportApp(tk.Tk):
         ttk.Button(btns_mo, text="Remove Last", command=self._remove_last_mo).pack(side=tk.LEFT, padx=6)
         ChemDropdown(f41, self._target_widget).pack(anchor="w", pady=2)
 
-        # 4.2. Formulation Risk (left)
+        # 4.2. Formulation Risk (left) — ii one line below title (style like before)
         f42 = ttk.Labelframe(grid, text="4.2. Formulation Risk")
         f42.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
         ii42 = ("Identify formulation risks that could cause product failure, regulatory noncompliance, or safety incidents. "
@@ -1089,7 +1179,7 @@ class ReportApp(tk.Tk):
                 "costs and timing if available.")
         self.txt_45 = self.plain_text_area(f45, height=10, ii_text=ii45)
 
-        # 4.6. Safety Assessment (spans both)
+        # 4.6. Safety Assessment
         f46 = ttk.Labelframe(grid, text="4.6. Safety Assessment")
         f46.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=4, pady=4)
         ii46 = ("Specify PPE, ventilation or containment, storage and segregation constraints, spill response, training, and any "
@@ -1101,7 +1191,6 @@ class ReportApp(tk.Tk):
         notebook.add(tab, text="5. Quality")
         self._tab_roots.append(tab); self._apply_ui_watermark(tab)
 
-        # Two-column grid like section 6
         grid = ttk.Frame(tab)
         grid.pack(fill="both", expand=True)
         grid.columnconfigure(0, weight=1)
@@ -1109,36 +1198,48 @@ class ReportApp(tk.Tk):
 
         f1 = ttk.Labelframe(grid, text="5.1. Raw Material Sourcing")
         f1.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
-        self.txt_q_sourcing = self.labeled_text(f1, "Text:", height=10,
-                                                ii_text="Approved vendors, alternates, and supply risks.")
+        self.txt_q_sourcing = self.labeled_text(f1, "", height=10,
+                                                ii_text="Approved vendors, alternates, and supply risks.", ii_at_start=True)
 
         f2 = ttk.Labelframe(grid, text="5.2. LIMS Setup")
         f2.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
-        self.txt_q_lims = self.labeled_text(f2, "Text:", height=10,
-                                            ii_text="Parameters, methods, specs, sampling plans, and release criteria.")
+        self.txt_q_lims = self.labeled_text(f2, "", height=10,
+                                            ii_text="Parameters, methods, specs, sampling plans, and release criteria.", ii_at_start=True)
 
         f3 = ttk.Labelframe(grid, text="5.3. Stability Testing")
         f3.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
-        self.txt_q_stability = self.labeled_text(f3, "Text:", height=10,
-                                                 ii_text="Study design, storage conditions, timepoints, and acceptance ranges.")
+        self.txt_q_stability = self.labeled_text(f3, "", height=10,
+                                                 ii_text="Study design, storage conditions, timepoints, and acceptance ranges.", ii_at_start=True)
 
         f4 = ttk.Labelframe(grid, text="5.4. Packaging Compatibility")
         f4.grid(row=1, column=1, sticky="nsew", padx=4, pady=4)
-        self.txt_q_pack = self.labeled_text(f4, "Text:", height=10,
-                                            ii_text="Container/closure, liners, valves, migration/leachables, and shelf life.")
+        self.txt_q_pack = self.labeled_text(f4, "", height=10,
+                                            ii_text="Container/closure, liners, valves, migration/leachables, and shelf life.", ii_at_start=True)
 
         symbar = ttk.Frame(tab); symbar.pack(fill="x", pady=(6, 0))
         ChemDropdown(symbar, self._target_widget).pack(side=tk.LEFT, padx=(0, 6))
 
     def _small_text(self, parent, label, ii=None):
         frame = ttk.Frame(parent)
-        top = ttk.Frame(frame); top.pack(fill="x")
-        ttk.Label(top, text=label, anchor="w").pack(side=tk.LEFT)
-        if ii: info_icon(top, ii)
+
+        # Row 1: subsection title
+        title_row = ttk.Frame(frame)
+        title_row.pack(fill="x")
+        ttk.Label(title_row, text=label, anchor="w").pack(side=tk.LEFT)
+
+        # Row 2: ii on its own line (immediately under title, flush-left)
+        if ii:
+            ii_row = ttk.Frame(frame)
+            ii_row.pack(fill="x", pady=(2, 2))
+            info_icon(ii_row, ii)  # icon only, left-anchored
+
+        # Row 3: the text area
         txt = tk.Text(frame, height=4, wrap="word")
         txt.pack(fill="both", expand=True)
+
         self._watch_widget(txt)
         return frame, txt
+
 
     def _smart_goal_row(self, parent, key, title, ii_text):
         row = ttk.Frame(parent)
@@ -1154,15 +1255,14 @@ class ReportApp(tk.Tk):
         notebook.add(tab, text="6. Commercial")
         self._tab_roots.append(tab); self._apply_ui_watermark(tab)
 
-        # Two-column grid container
         grid = ttk.Frame(tab); grid.pack(fill="both", expand=True)
         grid.columnconfigure(0, weight=1); grid.columnconfigure(1, weight=1)
 
-        # 6.1. Customer Objectives / Problem Statement
-        f61, self.txt_c_obj_problem = self._small_text(
-            grid, "6.1. Customer Objectives / Problem Statement",
-            ii="Plain-English summary of the customer's challenge, desired outcome, and target application."
-        ); f61.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        # 6.1. Customer Objectives / Problem Statement (ii one line below)
+        f61 = ttk.Labelframe(grid, text="6.1. Customer Objectives / Problem Statement"); f61.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        ii61 = ttk.Frame(f61); ii61.pack(fill="x")
+        info_icon(ii61, "Plain-English summary of the customer's challenge, desired outcome, and target application.")
+        self.txt_c_obj_problem = tk.Text(f61, height=4, wrap="word"); self.txt_c_obj_problem.pack(fill="both", expand=True)
 
         # 6.2. SMART Success Criteria
         f62 = ttk.Labelframe(grid, text="6.2. SMART Success Criteria"); f62.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
@@ -1177,29 +1277,48 @@ class ReportApp(tk.Tk):
         for i,(k,title,ii) in enumerate(rows):
             r, var = self._smart_goal_row(f62, k, title, ii); r.pack(fill="x", pady=2); self.smart_vars[k]=var
 
-        # 6.3.–6.11. (revised ii content)
+        # 6.3.–6.11. (ii row below titles; remove duplicate headings)
         f63, self.txt_c_specs = self._small_text(grid, "6.3. Customer Specifications",
-                                                 ii="Performance specs, test methods, and acceptance criteria."); f63.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+                                                 ); f63.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        info_icon(f63, "Performance specs, test methods, and acceptance criteria.")
+
         f64, self.txt_c_expected_volume = self._small_text(grid, "6.4. Expected Business Volume",
-                                                           ii="Estimated annual/seasonal demand with units and key assumptions."); f64.grid(row=1, column=1, sticky="nsew", padx=4, pady=4)
+                                                           ); f64.grid(row=1, column=1, sticky="nsew", padx=4, pady=4)
+        info_icon(f64, "Estimated annual/seasonal demand with units and key assumptions.")
+
         f65, self.txt_c_packaging_req = self._small_text(grid, "6.5. Packaging Requirement",
-                                                         ii="Sizes, materials, closures, labeling, and any special handling/UN/DOT needs."); f65.grid(row=2, column=0, sticky="nsew", padx=4, pady=4)
+                                                         ); f65.grid(row=2, column=0, sticky="nsew", padx=4, pady=4)
+        info_icon(f65, "Sizes, materials, closures, labeling, and any special handling/UN/DOT needs.")
+
         f66, self.txt_c_raw_material_prefs = self._small_text(grid, "6.6. Raw Material Restrictions / Preferences",
-                                                              ii="Forbidden/allowed substances, required certifications (OMRI, Kosher, Halal), origin or purity constraints."); f66.grid(row=2, column=1, sticky="nsew", padx=4, pady=4)
+                                                              ); f66.grid(row=2, column=1, sticky="nsew", padx=4, pady=4)
+        info_icon(f66, "Forbidden/allowed substances, required certifications (OMRI, Kosher, Halal), origin or purity constraints.")
+
         f67, self.txt_c_sample_needed = self._small_text(grid, "6.7. Sample Needed",
-                                                         ii="Quantity, packaging, requested tests, and needed-by date."); f67.grid(row=3, column=0, sticky="nsew", padx=4, pady=4)
+                                                         ); f67.grid(row=3, column=0, sticky="nsew", padx=4, pady=4)
+        info_icon(f67, "Quantity, packaging, requested tests, and needed-by date.")
+
         f68, self.txt_c_opportunity_timeline = self._small_text(grid, "6.8. Opportunity Timeline",
-                                                                ii="Key milestones: ITNO/NDA, sample ship, pilot/field trial, PO, launch."); f68.grid(row=3, column=1, sticky="nsew", padx=4, pady=4)
+                                                                ); f68.grid(row=3, column=1, sticky="nsew", padx=4, pady=4)
+        info_icon(f68, "Key milestones: ITNO/NDA, sample ship, pilot/field trial, PO, launch.")
+
         f69, self.txt_c_target = self._small_text(grid, "6.9. Target Application",
-                                                  ii="Crop/use case, application method, dose rates, and environmental conditions."); f69.grid(row=4, column=0, sticky="nsew", padx=4, pady=4)
+                                                  ); f69.grid(row=4, column=0, sticky="nsew", padx=4, pady=4)
+        info_icon(f69, "Crop/use case, application method, dose rates, and environmental conditions.")
+
         f610, self.txt_c_feedback = self._small_text(grid, "6.10. Customer Feedback",
-                                                     ii="Notes from calls, demos, and trials—include quotes or quantified results when useful."); f610.grid(row=4, column=1, sticky="nsew", padx=4, pady=4)
+                                                     ); f610.grid(row=4, column=1, sticky="nsew", padx=4, pady=4)
+        info_icon(f610, "Notes from calls, demos, and trials—include quotes or quantified results when useful.")
+
         f611, self.txt_c_tds = self._small_text(grid, "6.11. TDS Development",
-                                                ii="Status of the Technical Data Sheet—version, pending tests, owner, next steps."); f611.grid(row=5, column=0, sticky="nsew", padx=4, pady=4)
+                                                ); f611.grid(row=5, column=0, sticky="nsew", padx=4, pady=4)
+        info_icon(f611, "Status of the Technical Data Sheet—version, pending tests, owner, next steps.")
 
         # 6.12. Email Correspondence (table + New dialog)
         f612 = ttk.Labelframe(grid, text="6.12. Email Correspondence")
         f612.grid(row=5, column=1, sticky="nsew", padx=4, pady=4)
+        ii612 = ttk.Frame(f612); ii612.pack(fill="x")
+        info_icon(ii612, "Log of relevant customer emails and notes.")
         cols = ("Date", "Customer Name", "Correspondence")
         self.email_tree = ttk.Treeview(f612, columns=cols, show="headings", height=6)
         for i, c in enumerate(cols):
@@ -1212,6 +1331,62 @@ class ReportApp(tk.Tk):
 
         symbar = ttk.Frame(tab); symbar.pack(fill="x", pady=(6, 0))
         ChemDropdown(symbar, self._target_widget).pack(side=tk.LEFT, padx=(0, 6))
+
+    # ----- Misc items dialogs -----
+    def _misc_add_dialog(self):
+        self._misc_dialog()
+
+    def _misc_edit_dialog(self):
+        sel = self.misc_tree.selection()
+        if not sel:
+            messagebox.showinfo("Edit", "Select an item to edit.")
+            return
+        idx = self.misc_tree.index(sel[0])
+        if 0 <= idx < len(self._misc_items):
+            self._misc_dialog(existing=self._misc_items[idx], edit_index=idx)
+
+    def _misc_delete(self):
+        sel = self.misc_tree.selection()
+        if not sel: return
+        idxs = [self.misc_tree.index(i) for i in sel]
+        for i in sorted(idxs, reverse=True):
+            if 0 <= i < len(self._misc_items):
+                del self._misc_items[i]
+        self._rebuild_misc_list()
+
+    def _misc_dialog(self, existing: Optional[MiscItem]=None, edit_index: Optional[int]=None):
+        win = tk.Toplevel(self); win.title("Miscellaneous Item"); win.geometry("700x520")
+        frm = ttk.Frame(win, padding=8); frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text="Title:").grid(row=0, column=0, sticky="w")
+        v_title = tk.StringVar(value=(existing.title if existing else ""))
+        ent_title = ttk.Entry(frm, textvariable=v_title); ent_title.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
+
+        ttk.Label(frm, text="Content:").grid(row=1, column=0, sticky="nw")
+        txt_body = tk.Text(frm, height=16, wrap="word"); txt_body.grid(row=1, column=1, sticky="nsew", padx=6, pady=4)
+        if existing:
+            txt_body.insert("1.0", existing.content)
+
+        frm.columnconfigure(1, weight=1); frm.rowconfigure(1, weight=1)
+        btns = ttk.Frame(frm); btns.grid(row=2, column=1, sticky="e", pady=8)
+        def save():
+            title = v_title.get().strip() or "Untitled"
+            body = txt_body.get("1.0","end").strip()
+            item = MiscItem(title=title, content=body)
+            if edit_index is None:
+                self._misc_items.append(item)
+            else:
+                self._misc_items[edit_index] = item
+            self._rebuild_misc_list()
+            win.destroy()
+        ttk.Button(btns, text="Save", command=save).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.LEFT, padx=4)
+
+    def _rebuild_misc_list(self):
+        for iid in self.misc_tree.get_children(""):
+            self.misc_tree.delete(iid)
+        for m in getattr(self, "_misc_items", []):
+            self.misc_tree.insert("", "end", values=(m.title,))
 
     def _email_new_dialog(self):
         win = tk.Toplevel(self); win.title("New Email Entry"); win.geometry("640x420")
@@ -1243,6 +1418,7 @@ class ReportApp(tk.Tk):
         for iid in self.email_tree.selection():
             self.email_tree.delete(iid)
 
+    # ----------------- Export / Generate (collapsible + select all) -----------------
     def _tab_export(self, notebook):
         tab = ttk.Frame(notebook, padding=10)
         notebook.add(tab, text="Export / Generate")
@@ -1265,32 +1441,87 @@ class ReportApp(tk.Tk):
             ttk.Radiobutton(fmt, text=lab, variable=self.export_fmt, value=v).pack(side=tk.LEFT, padx=6)
 
         chooser = ttk.Labelframe(tab, text="Include in output"); chooser.pack(fill="both", expand=True, pady=(6, 10))
-        self.include = {}
+
+        # helper to make/check include vars
         def mkvar(key, default=True):
-            self.include[key] = tk.BooleanVar(value=default); return self.include[key]
+            if not hasattr(self, "include") or self.include is None:
+                self.include = {}
+            if key not in self.include:
+                self.include[key] = tk.BooleanVar(value=default)
+            return self.include[key]
 
-        sec_frame = ttk.Frame(chooser); sec_frame.pack(fill="x", pady=(6, 2))
-        ttk.Label(sec_frame, text="1. General").grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(sec_frame, text="Include", variable=mkvar("sec_general")).grid(row=0, column=1, sticky="w", padx=8)
+        # --- Select / Deselect All ---
+        master_row = ttk.Frame(chooser); master_row.pack(fill="x", pady=(6, 4))
+        self._master_select = tk.BooleanVar(value=True)
+        ttk.Checkbutton(master_row, text="Select / Deselect All", variable=self._master_select,
+                        command=lambda: self._toggle_all(self._master_select.get())).pack(side=tk.LEFT)
 
-        tech = ttk.LabelFrame(chooser, text="2. Technical")
-        tech.pack(fill="x", padx=4, pady=4)
-        ttk.Checkbutton(tech, text="2.1. Plain Summary", variable=mkvar("t_plain")).pack(anchor="w")
-        ttk.Checkbutton(tech, text="2.2. Objectives", variable=mkvar("t_objectives")).pack(anchor="w")
-        ttk.Checkbutton(tech, text="2.3. Methods", variable=mkvar("t_methods")).pack(anchor="w")
-        ttk.Checkbutton(tech, text="  2.3.1. Raw Materials", variable=mkvar("t_rm")).pack(anchor="w", padx=16)
-        ttk.Checkbutton(tech, text="  2.3.2. Instrument", variable=mkvar("t_ins")).pack(anchor="w", padx=16)
-        ttk.Checkbutton(tech, text="  2.3.3. Experimental Procedure", variable=mkvar("t_proc")).pack(anchor="w", padx=16)
-        ttk.Checkbutton(tech, text="  2.3.4. Trial History", variable=mkvar("t_trial")).pack(anchor="w", padx=16)
-        ttk.Checkbutton(tech, text="2.4. Results", variable=mkvar("t_results")).pack(anchor="w")
-        ttk.Checkbutton(tech, text="2.5. Conclusion", variable=mkvar("t_conc")).pack(anchor="w")
-        ttk.Checkbutton(tech, text="2.6. Miscellaneous", variable=mkvar("t_misc")).pack(anchor="w")
-        ttk.Checkbutton(tech, text="2.7. References", variable=mkvar("t_refs")).pack(anchor="w")
+        ttk.Separator(chooser, orient="horizontal").pack(fill="x", pady=4)
 
-        ttk.Checkbutton(chooser, text="3. Regulatory", variable=mkvar("sec_reg")).pack(anchor="w")
-        ttk.Checkbutton(chooser, text="4. Scale Up", variable=mkvar("sec_scale")).pack(anchor="w")
-        ttk.Checkbutton(chooser, text="5. Quality", variable=mkvar("sec_quality")).pack(anchor="w")
-        ttk.Checkbutton(chooser, text="6. Commercial", variable=mkvar("sec_commercial")).pack(anchor="w")
+        # container
+        container = ttk.Frame(chooser); container.pack(fill="both", expand=True)
+
+        # 1. General
+        sec1 = Collapsible(container, "1. General", mkvar("sec_general", True))
+        sec1.pack(fill="x", expand=False, pady=2)
+        # no subsections
+
+        # 2. Technical
+        sec2 = Collapsible(container, "2. Technical", mkvar("sec_tech", True))
+        sec2.pack(fill="x", expand=False, pady=2)
+        ttk.Checkbutton(sec2.body, text="2.1. Plain Language Summary", variable=mkvar("t_plain", True)).pack(anchor="w")
+        ttk.Checkbutton(sec2.body, text="2.2. Objectives", variable=mkvar("t_objectives", True)).pack(anchor="w")
+        ttk.Checkbutton(sec2.body, text="2.3. Methods", variable=mkvar("t_methods", True)).pack(anchor="w", pady=(4,0))
+        sub23 = ttk.Frame(sec2.body); sub23.pack(fill="x", padx=18)
+        ttk.Checkbutton(sub23, text="2.3.1. Raw Materials", variable=mkvar("t_rm", True)).pack(anchor="w")
+        ttk.Checkbutton(sub23, text="2.3.2. Instrument", variable=mkvar("t_ins", True)).pack(anchor="w")
+        ttk.Checkbutton(sub23, text="2.3.3. Experimental Procedure", variable=mkvar("t_proc", True)).pack(anchor="w")
+        ttk.Checkbutton(sub23, text="2.3.4. Trial History", variable=mkvar("t_trial", True)).pack(anchor="w")
+        ttk.Checkbutton(sec2.body, text="2.4. Results", variable=mkvar("t_results", True)).pack(anchor="w", pady=(4,0))
+        ttk.Checkbutton(sec2.body, text="2.5. Conclusion", variable=mkvar("t_conc", True)).pack(anchor="w")
+        ttk.Checkbutton(sec2.body, text="2.6. References", variable=mkvar("t_refs", True)).pack(anchor="w")
+        ttk.Checkbutton(sec2.body, text="2.7. Miscellaneous", variable=mkvar("t_misc", True)).pack(anchor="w")
+
+        # 3. Regulatory
+        sec3 = Collapsible(container, "3. Regulatory", mkvar("sec_reg", True))
+        sec3.pack(fill="x", expand=False, pady=2)
+        ttk.Checkbutton(sec3.body, text="3.1. Application Regulations", variable=mkvar("reg_31", True)).pack(anchor="w")
+        ttk.Checkbutton(sec3.body, text="3.2. Label Requirements", variable=mkvar("reg_32", True)).pack(anchor="w")
+        ttk.Checkbutton(sec3.body, text="3.3. Certification Requirements", variable=mkvar("reg_33", True)).pack(anchor="w")
+
+        # 4. Scale Up
+        sec4 = Collapsible(container, "4. Scale Up", mkvar("sec_scale", True))
+        sec4.pack(fill="x", expand=False, pady=2)
+        ttk.Checkbutton(sec4.body, text="4.1. Manufacturing Order", variable=mkvar("s_41", True)).pack(anchor="w")
+        ttk.Checkbutton(sec4.body, text="4.2. Formulation Risk", variable=mkvar("s_42", True)).pack(anchor="w")
+        ttk.Checkbutton(sec4.body, text="4.3. Hazards", variable=mkvar("s_43", True)).pack(anchor="w")
+        ttk.Checkbutton(sec4.body, text="4.4. Equipment", variable=mkvar("s_44", True)).pack(anchor="w")
+        ttk.Checkbutton(sec4.body, text="4.5. CAPEX Requirements", variable=mkvar("s_45", True)).pack(anchor="w")
+        ttk.Checkbutton(sec4.body, text="4.6. Safety Assessment", variable=mkvar("s_46", True)).pack(anchor="w")
+
+        # 5. Quality
+        sec5 = Collapsible(container, "5. Quality", mkvar("sec_quality", True))
+        sec5.pack(fill="x", expand=False, pady=2)
+        ttk.Checkbutton(sec5.body, text="5.1. Raw Material Sourcing", variable=mkvar("q_51", True)).pack(anchor="w")
+        ttk.Checkbutton(sec5.body, text="5.2. LIMS Setup", variable=mkvar("q_52", True)).pack(anchor="w")
+        ttk.Checkbutton(sec5.body, text="5.3. Stability Testing", variable=mkvar("q_53", True)).pack(anchor="w")
+        ttk.Checkbutton(sec5.body, text="5.4. Packaging Compatibility", variable=mkvar("q_54", True)).pack(anchor="w")
+
+        # 6. Commercial
+        sec6 = Collapsible(container, "6. Commercial", mkvar("sec_commercial", True))
+        sec6.pack(fill="x", expand=False, pady=2)
+        ttk.Checkbutton(sec6.body, text="6.1. Customer Objectives / Problem Statement", variable=mkvar("c_61", True)).pack(anchor="w")
+        ttk.Checkbutton(sec6.body, text="6.2. SMART Success Criteria", variable=mkvar("c_62", True)).pack(anchor="w")
+        ttk.Checkbutton(sec6.body, text="6.3. Customer Specifications", variable=mkvar("c_63", True)).pack(anchor="w")
+        ttk.Checkbutton(sec6.body, text="6.4. Expected Business Volume", variable=mkvar("c_64", True)).pack(anchor="w")
+        ttk.Checkbutton(sec6.body, text="6.5. Packaging Requirement", variable=mkvar("c_65", True)).pack(anchor="w")
+        ttk.Checkbutton(sec6.body, text="6.6. Raw Material Restrictions / Preferences", variable=mkvar("c_66", True)).pack(anchor="w")
+        ttk.Checkbutton(sec6.body, text="6.7. Sample Needed", variable=mkvar("c_67", True)).pack(anchor="w")
+        ttk.Checkbutton(sec6.body, text="6.8. Opportunity Timeline", variable=mkvar("c_68", True)).pack(anchor="w")
+        ttk.Checkbutton(sec6.body, text="6.9. Target Application", variable=mkvar("c_69", True)).pack(anchor="w")
+        ttk.Checkbutton(sec6.body, text="6.10. Customer Feedback", variable=mkvar("c_610", True)).pack(anchor="w")
+        ttk.Checkbutton(sec6.body, text="6.11. TDS Development", variable=mkvar("c_611", True)).pack(anchor="w")
+        ttk.Checkbutton(sec6.body, text="6.12. Email Correspondence", variable=mkvar("c_612", True)).pack(anchor="w")
 
         out = ttk.Frame(tab); out.pack(fill="x", pady=6)
         ttk.Label(out, text="Output folder:").pack(side=tk.LEFT)
@@ -1299,12 +1530,19 @@ class ReportApp(tk.Tk):
         ttk.Button(out, text="Choose...", command=self._pick_outdir).pack(side=tk.LEFT)
 
         ttk.Button(tab, text="Generate Report", command=self._generate).pack(anchor="w", pady=12)
-        ttk.Label(tab, text="Tip: For 2.4. tables, paste directly from Excel/CSV—I'll detect the columns.",
+        ttk.Label(tab, text="Tip: Expand a section title to show/hide its subsections.",
                   foreground="#555").pack(anchor="w", pady=6)
 
-        for k in ["sec_general", "t_plain", "t_objectives", "t_methods", "t_rm", "t_ins", "t_proc", "t_trial",
-                  "t_results", "t_conc", "t_misc", "t_refs", "sec_reg", "sec_scale", "sec_quality", "sec_commercial"]:
-            self.include[k].set(True)
+        # Initialize defaults
+        for k in self._include_state_keys:
+            mkvar(k, True).set(True)
+
+    def _toggle_all(self, state: bool):
+        for key, var in self.include.items():
+            try:
+                var.set(state)
+            except Exception:
+                pass
 
     # ---------- Objectives rows ----------
     def _add_objective_row(self):
@@ -1402,29 +1640,24 @@ class ReportApp(tk.Tk):
         win = tk.Toplevel(self); win.title("Result Item"); win.geometry("820x560")
         frm = ttk.Frame(win, padding=8); frm.pack(fill="both", expand=True)
 
-        # Title
         ttk.Label(frm, text="Title:").grid(row=0, column=0, sticky="w")
         v_title = tk.StringVar(value=(existing.title if existing else ""))
         ent_title = ttk.Entry(frm, textvariable=v_title); ent_title.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
 
-        # Kind
         ttk.Label(frm, text="Type:").grid(row=1, column=0, sticky="w")
         v_kind = tk.StringVar(value=(existing.kind if existing else "text"))
         kinds = ttk.Frame(frm); kinds.grid(row=1, column=1, sticky="w", padx=6, pady=4)
         for val, lab in [("text","Text"),("table","Table"),("image","Image(s)")]:
             ttk.Radiobutton(kinds, text=lab, value=val, variable=v_kind).pack(side=tk.LEFT, padx=(0,8))
 
-        # Stacked frames
         stack = ttk.Frame(frm); stack.grid(row=2, column=0, columnspan=2, sticky="nsew")
         frm.rowconfigure(2, weight=1); frm.columnconfigure(1, weight=1)
 
-        # TEXT frame
         text_frame = ttk.Frame(stack); 
         txt_text = tk.Text(text_frame, height=16, wrap="word"); txt_text.pack(fill="both", expand=True)
         if existing and existing.kind=="text":
             txt_text.insert("1.0", existing.content)
 
-        # TABLE frame
         table_frame = ttk.Frame(stack)
         ttk.Label(table_frame, text="Paste CSV/TSV or plain text table (auto-detect):").pack(anchor="w")
         txt_table = tk.Text(table_frame, height=14, wrap="none"); txt_table.pack(fill="both", expand=True, pady=(2,4))
@@ -1438,7 +1671,6 @@ class ReportApp(tk.Tk):
             else:
                 txt_table.insert("1.0", existing.content or "")
 
-        # IMAGE frame
         image_frame = ttk.Frame(stack)
         mgr = ImageManager(image_frame, initial_files=(existing.images if existing and existing.kind=="image" else None))
         mgr.pack(fill="both", expand=True)
@@ -1455,7 +1687,6 @@ class ReportApp(tk.Tk):
         show(v_kind.get())
         v_kind.trace_add("write", lambda *_: show(v_kind.get()))
 
-        # Buttons
         btns = ttk.Frame(frm); btns.grid(row=3, column=1, sticky="e", pady=8)
         def save():
             title = v_title.get().strip() or "Untitled"
@@ -1515,8 +1746,8 @@ class ReportApp(tk.Tk):
 
         r.results = list(self._results)
         r.conclusion = safe_split_lines(self.txt_conclusion.get("1.0", "end"))
-        r.miscellaneous = self.txt_misc.get("1.0", "end").strip()
         r.references = safe_split_lines(self.txt_refs.get("1.0", "end"))
+        r.miscellaneous_items = list(getattr(self, "_misc_items", []))
 
         # Regulatory
         r.regulations = self.txt_regs.get("1.0", "end").strip()
@@ -1585,15 +1816,12 @@ class ReportApp(tk.Tk):
 
     def _add_page_number_footer_docx(self, doc, footer_img: Optional[str]):
         for section in doc.sections:
-            # Footer image (bottom band)
             footer = section.footer
-            # Clear default empty paragraph text
             if footer.paragraphs:
                 footer.paragraphs[0].clear()
             if footer_img and os.path.isfile(footer_img):
                 p_img = footer.add_paragraph()
                 run_img = p_img.add_run()
-                # Scale image to printable width
                 try:
                     usable_w_in = section.page_width.inches - section.left_margin.inches - section.right_margin.inches
                 except Exception:
@@ -1602,11 +1830,8 @@ class ReportApp(tk.Tk):
                     run_img.add_picture(footer_img, width=Inches(usable_w_in))
                 except Exception:
                     pass
-            # Page number at right
             p = footer.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
             fld = OxmlElement('w:fldSimple'); fld.set(qn('w:instr'), 'PAGE'); p._p.append(fld)
-
-            # Place footer closer to the bottom edge
             try:
                 section.footer_distance = Inches(0.25)
             except Exception:
@@ -1615,7 +1840,6 @@ class ReportApp(tk.Tk):
     def _add_header_docx(self, doc, header_img: Optional[str]):
         for section in doc.sections:
             header = section.header
-            # Clear default empty paragraph text
             if header.paragraphs:
                 header.paragraphs[0].clear()
             if header_img and os.path.isfile(header_img):
@@ -1629,13 +1853,10 @@ class ReportApp(tk.Tk):
                     run_img.add_picture(header_img, width=Inches(usable_w_in))
                 except Exception:
                     pass
-            # Place header closer to the top edge
             try:
                 section.header_distance = Inches(0.25)
             except Exception:
                 pass
-
-            # Ensure same header/footer on first page too
             try:
                 section.different_first_page_header_footer = False
             except Exception:
@@ -1645,15 +1866,14 @@ class ReportApp(tk.Tk):
         include = self.include
         doc = Document()
 
-        # Apply proper header & footer bands on all pages
         self._add_header_docx(doc, header_img)
         self._add_page_number_footer_docx(doc, footer_img)
 
-        # Title (centered)
         p = doc.add_paragraph()
         run = p.add_run(r.project_title); run.bold = True; run.font.size = Pt(14)
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
+        # 1. General
         if include["sec_general"].get():
             self._H1(doc, "\n1. General Information")
             table = doc.add_table(rows=0, cols=2)
@@ -1667,152 +1887,170 @@ class ReportApp(tk.Tk):
             add_row("Total Hours", r.total_hours)
 
         # 2. Technical
-        self._H1(doc, "\n2. Technical Information")
+        if include["sec_tech"].get():
+            self._H1(doc, "\n2. Technical Information")
 
-        if include["t_plain"].get():
-            self._H2(doc, "2.1. Plain Language Summary")
-            self._body_para(doc, r.plain_summary, level=2)
+            if include["t_plain"].get():
+                self._H2(doc, "2.1. Plain Language Summary")
+                self._body_para(doc, r.plain_summary, level=2)
 
-        if include["t_objectives"].get():
-            self._H2(doc, "2.2. Objectives")
-            for it in r.objectives:
-                self._list_para(doc, it, numbered=True, level=2)
+            if include["t_objectives"].get():
+                self._H2(doc, "2.2. Objectives")
+                for it in r.objectives:
+                    self._list_para(doc, it, numbered=True, level=2)
 
-        if include["t_methods"].get():
-            self._H2(doc, "2.3. Methods")
-            if include["t_rm"].get():
-                self._H3(doc, "2.3.1. Raw Materials")
-                for x in r.methods_raw_materials:
-                    self._list_para(doc, x, numbered=False, level=3)
-            if include["t_ins"].get():
-                self._H3(doc, "2.3.2. Instrument")
-                for x in r.methods_instruments:
-                    self._list_para(doc, x, numbered=False, level=3)
-            if include["t_proc"].get():
-                self._H3(doc, "2.3.3. Experimental Procedure")
-                for x in r.methods_procedure:
-                    self._list_para(doc, x, numbered=False, level=3)
-            if include["t_trial"].get():
-                self._H3(doc, "2.3.4. Trial History")
-                if r.trial_history:
-                    t = doc.add_table(rows=1, cols=3)
-                    try: t.style = r.trial_docx_style
-                    except Exception: t.style = "Table Grid"
-                    hdr = t.rows[0].cells
-                    hdr[0].text, hdr[1].text, hdr[2].text = "Trial#", "Issue", "Possible Reasons"
-                    for tr in r.trial_history:
-                        c = t.add_row().cells
-                        c[0].text, c[1].text, c[2].text = tr.number, tr.issue, tr.reasons
+            if include["t_methods"].get():
+                self._H2(doc, "2.3. Methods")
+                if include["t_rm"].get():
+                    self._H3(doc, "2.3.1. Raw Materials")
+                    for x in r.methods_raw_materials:
+                        self._list_para(doc, x, numbered=False, level=3)
+                if include["t_ins"].get():
+                    self._H3(doc, "2.3.2. Instrument")
+                    for x in r.methods_instruments:
+                        self._list_para(doc, x, numbered=False, level=3)
+                if include["t_proc"].get():
+                    self._H3(doc, "2.3.3. Experimental Procedure")
+                    for x in r.methods_procedure:
+                        self._list_para(doc, x, numbered=False, level=3)
+                if include["t_trial"].get():
+                    self._H3(doc, "2.3.4. Trial History")
+                    if r.trial_history:
+                        t = doc.add_table(rows=1, cols=3)
+                        try: t.style = r.trial_docx_style
+                        except Exception: t.style = "Table Grid"
+                        hdr = t.rows[0].cells
+                        hdr[0].text, hdr[1].text, hdr[2].text = "Trial#", "Issue", "Possible Reasons"
+                        for tr in r.trial_history:
+                            c = t.add_row().cells
+                            c[0].text, c[1].text, c[2].text = tr.number, tr.issue, tr.reasons
 
-        if include["t_results"].get():
-            self._H2(doc, "2.4. Results")
-            for idx, it in enumerate(r.results, 1):
-                if it.kind == "text":
-                    self._H3(doc, f"2.4.{idx}. {it.title}")
-                    for line in safe_split_lines(it.content):
-                        self._body_para(doc, line, level=3)
-                elif it.kind == "table":
-                    self._H3(doc, f"{it.title}")
-                    data = it.table_data if it.table_data else parse_table_text(it.content)
-                    if data:
-                        rows = len(data); cols = max(len(rw) for rw in data)
-                        tb = doc.add_table(rows=rows, cols=cols)
-                        try: tb.style = it.table_style
-                        except Exception: tb.style = "Table Grid"
-                        for r_i, row in enumerate(data):
-                            for c_i in range(cols):
-                                tb.cell(r_i, c_i).text = row[c_i] if c_i < len(row) else ""
-                elif it.kind == "image":
-                    imgs = it.images if it.images else ([it.image_path] if it.image_path else [])
-                    if imgs:
-                        if it.title: self._H3(doc, f"{it.title}")
-                        for pth in imgs:
-                            if pth and os.path.isfile(pth):
-                                try: doc.add_picture(pth, width=Inches(5.8))
-                                except Exception: continue
-                                if it.caption:
-                                    pcap = doc.add_paragraph(it.caption); 
-                                    pcap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                                    pcap.paragraph_format.left_indent = Inches(0.5)
+            if include["t_results"].get():
+                self._H2(doc, "2.4. Results")
+                for idx, it in enumerate(r.results, 1):
+                    if it.kind == "text":
+                        self._H3(doc, f"2.4.{idx}. {it.title}")
+                        for line in safe_split_lines(it.content):
+                            self._body_para(doc, line, level=3)
+                    elif it.kind == "table":
+                        self._H3(doc, f"{it.title}")
+                        data = it.table_data if it.table_data else parse_table_text(it.content)
+                        if data:
+                            rows = len(data); cols = max(len(rw) for rw in data)
+                            tb = doc.add_table(rows=rows, cols=cols)
+                            try: tb.style = it.table_style
+                            except Exception: tb.style = "Table Grid"
+                            for r_i, row in enumerate(data):
+                                for c_i in range(cols):
+                                    tb.cell(r_i, c_i).text = row[c_i] if c_i < len(row) else ""
+                    elif it.kind == "image":
+                        imgs = it.images if it.images else ([it.image_path] if it.image_path else [])
+                        if imgs:
+                            if it.title: self._H3(doc, f"{it.title}")
+                            for pth in imgs:
+                                if pth and os.path.isfile(pth):
+                                    try: doc.add_picture(pth, width=Inches(5.8))
+                                    except Exception: continue
+                                    if it.caption:
+                                        pcap = doc.add_paragraph(it.caption); 
+                                        pcap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                                        pcap.paragraph_format.left_indent = Inches(0.5)
 
-        if include["t_conc"].get():
-            self._H2(doc, "2.5. Conclusion")
-            for x in r.conclusion:
-                self._list_para(doc, x, numbered=False, level=2)
+            if include["t_conc"].get():
+                self._H2(doc, "2.5. Conclusion")
+                for x in r.conclusion:
+                    self._list_para(doc, x, numbered=False, level=2)
 
-        if include["t_misc"].get():
-            self._H2(doc, "2.6. Miscellaneous")
-            self._body_para(doc, r.miscellaneous, level=2)
+            if include["t_refs"].get():
+                self._H2(doc, "2.6. References")
+                for x in r.references:
+                    self._list_para(doc, x, numbered=False, level=2)
 
-        if include["t_refs"].get():
-            self._H2(doc, "2.7. References")
-            for x in r.references:
-                self._list_para(doc, x, numbered=False, level=2)
+            if include["t_misc"].get():
+                self._H2(doc, "2.7. Miscellaneous")
+                for i, m in enumerate(r.miscellaneous_items, 1):
+                    self._H3(doc, f"2.7.{i}. {m.title}")
+                    self._body_para(doc, m.content, level=3)
 
         # 3. Regulatory
         if include["sec_reg"].get():
             self._H1(doc, "\n3. Regulatory")
-            self._H2(doc, "3.1. Application regulations"); self._body_para(doc, r.regulations, level=2)
-            self._H2(doc, "3.2. Label Requirements"); self._body_para(doc, r.label_req, level=2)
-            self._H2(doc, "3.3. Certification Requirements"); self._body_para(doc, r.certification_req, level=2)
+            if include["reg_31"].get():
+                self._H2(doc, "3.1. Application regulations"); self._body_para(doc, r.regulations, level=2)
+            if include["reg_32"].get():
+                self._H2(doc, "3.2. Label Requirements"); self._body_para(doc, r.label_req, level=2)
+            if include["reg_33"].get():
+                self._H2(doc, "3.3. Certification Requirements"); self._body_para(doc, r.certification_req, level=2)
 
         # 4. Scale Up
         if include["sec_scale"].get():
             self._H1(doc, "\n4. Scale Up")
-            self._H2(doc, "4.1. Manufacturing Order")
-            for step in r.manuf_order_steps:
-                self._list_para(doc, step, numbered=False, level=2)
-
-            self._H2(doc, "4.2. Formulation Risk")
-            self._body_para(doc, r.formulation_risk_text, level=2)
-
-            self._H2(doc, "4.3. Hazards")
-            self._body_para(doc, r.hazards_text, level=2)
-
-            self._H2(doc, "4.4. Equipment")
-            self._body_para(doc, r.equipment_text, level=2)
-
-            self._H2(doc, "4.5. CAPEX Requirements")
-            self._body_para(doc, r.capex_text, level=2)
-
-            self._H2(doc, "4.6. Safety Assessment")
-            self._body_para(doc, r.safety_assess_text, level=2)
+            if include["s_41"].get():
+                self._H2(doc, "4.1. Manufacturing Order")
+                for step in r.manuf_order_steps:
+                    self._list_para(doc, step, numbered=False, level=2)
+            if include["s_42"].get():
+                self._H2(doc, "4.2. Formulation Risk"); self._body_para(doc, r.formulation_risk_text, level=2)
+            if include["s_43"].get():
+                self._H2(doc, "4.3. Hazards"); self._body_para(doc, r.hazards_text, level=2)
+            if include["s_44"].get():
+                self._H2(doc, "4.4. Equipment"); self._body_para(doc, r.equipment_text, level=2)
+            if include["s_45"].get():
+                self._H2(doc, "4.5. CAPEX Requirements"); self._body_para(doc, r.capex_text, level=2)
+            if include["s_46"].get():
+                self._H2(doc, "4.6. Safety Assessment"); self._body_para(doc, r.safety_assess_text, level=2)
 
         # 5. Quality
         if include["sec_quality"].get():
             self._H1(doc, "\n5. Quality")
-            self._H2(doc, "5.1. Raw Material Sourcing"); self._body_para(doc, r.raw_material_sourcing, level=2)
-            self._H2(doc, "5.2. LIMS Setup"); self._body_para(doc, r.lims_setup, level=2)
-            self._H2(doc, "5.3. Stability Testing"); self._body_para(doc, r.stability_testing, level=2)
-            self._H2(doc, "5.4. Packaging Compatibility"); self._body_para(doc, r.packaging_compatibility, level=2)
+            if include["q_51"].get():
+                self._H2(doc, "5.1. Raw Material Sourcing"); self._body_para(doc, r.raw_material_sourcing, level=2)
+            if include["q_52"].get():
+                self._H2(doc, "5.2. LIMS Setup"); self._body_para(doc, r.lims_setup, level=2)
+            if include["q_53"].get():
+                self._H2(doc, "5.3. Stability Testing"); self._body_para(doc, r.stability_testing, level=2)
+            if include["q_54"].get():
+                self._H2(doc, "5.4. Packaging Compatibility"); self._body_para(doc, r.packaging_compatibility, level=2)
 
         # 6. Commercial
         if include["sec_commercial"].get():
             self._H1(doc, "\n6. Commercial")
-            self._H2(doc, "6.1. Customer Objectives / Problem Statement"); self._body_para(doc, r.c_obj_problem, level=2)
-            self._H2(doc, "6.2. SMART Success Criteria")
-            for key, label in [("S","Specific"),("M","Measurable"),("A","Achievable"),("R","Relevant"),("T","Time-bound")]:
-                if r.smart_goals.get(key,"").strip():
-                    self._body_para(doc, f"{label}: {r.smart_goals[key]}", level=3)
-            self._H2(doc, "6.3. Customer Specifications"); self._body_para(doc, r.c_specs, level=2)
-            self._H2(doc, "6.4. Expected Business Volume"); self._body_para(doc, r.c_expected_volume, level=2)
-            self._H2(doc, "6.5. Packaging Requirement"); self._body_para(doc, r.c_packaging_req, level=2)
-            self._H2(doc, "6.6. Raw Material Restrictions / Preferences"); self._body_para(doc, r.c_raw_material_prefs, level=2)
-            self._H2(doc, "6.7. Sample Needed"); self._body_para(doc, r.c_sample_needed, level=2)
-            self._H2(doc, "6.8. Opportunity Timeline"); self._body_para(doc, r.c_opportunity_timeline, level=2)
-            self._H2(doc, "6.9. Target Application"); self._body_para(doc, r.target_application, level=2)
-            self._H2(doc, "6.10. Customer Feedback"); self._body_para(doc, r.customer_feedback, level=2)
-            self._H2(doc, "6.11. TDS Development"); self._body_para(doc, r.tds_development, level=2)
-            self._H2(doc, "6.12. Email Correspondence")
-            if r.email_correspondence:
-                t = doc.add_table(rows=1, cols=3)
-                try: t.style = "Table Grid"
-                except Exception: pass
-                hdr = t.rows[0].cells
-                hdr[0].text, hdr[1].text, hdr[2].text = "Date", "Customer Name", "Correspondence"
-                for e in r.email_correspondence:
-                    c = t.add_row().cells
-                    c[0].text, c[1].text, c[2].text = e.date, e.customer, e.correspondence
+            if include["c_61"].get():
+                self._H2(doc, "6.1. Customer Objectives / Problem Statement"); self._body_para(doc, r.c_obj_problem, level=2)
+            if include["c_62"].get():
+                self._H2(doc, "6.2. SMART Success Criteria")
+                for key, label in [("S","Specific"),("M","Measurable"),("A","Achievable"),("R","Relevant"),("T","Time-bound")]:
+                    if r.smart_goals.get(key,"").strip():
+                        self._body_para(doc, f"{label}: {r.smart_goals[key]}", level=3)
+            if include["c_63"].get():
+                self._H2(doc, "6.3. Customer Specifications"); self._body_para(doc, r.c_specs, level=2)
+            if include["c_64"].get():
+                self._H2(doc, "6.4. Expected Business Volume"); self._body_para(doc, r.c_expected_volume, level=2)
+            if include["c_65"].get():
+                self._H2(doc, "6.5. Packaging Requirement"); self._body_para(doc, r.c_packaging_req, level=2)
+            if include["c_66"].get():
+                self._H2(doc, "6.6. Raw Material Restrictions / Preferences"); self._body_para(doc, r.c_raw_material_prefs, level=2)
+            if include["c_67"].get():
+                self._H2(doc, "6.7. Sample Needed"); self._body_para(doc, r.c_sample_needed, level=2)
+            if include["c_68"].get():
+                self._H2(doc, "6.8. Opportunity Timeline"); self._body_para(doc, r.c_opportunity_timeline, level=2)
+            if include["c_69"].get():
+                self._H2(doc, "6.9. Target Application"); self._body_para(doc, r.target_application, level=2)
+            if include["c_610"].get():
+                self._H2(doc, "6.10. Customer Feedback"); self._body_para(doc, r.customer_feedback, level=2)
+            if include["c_611"].get():
+                self._H2(doc, "6.11. TDS Development"); self._body_para(doc, r.tds_development, level=2)
+            if include["c_612"].get():
+                self._H2(doc, "6.12. Email Correspondence")
+                if r.email_correspondence:
+                    t = doc.add_table(rows=1, cols=3)
+                    try: t.style = "Table Grid"
+                    except Exception: pass
+                    hdr = t.rows[0].cells
+                    hdr[0].text, hdr[1].text, hdr[2].text = "Date", "Customer Name", "Correspondence"
+                    for e in r.email_correspondence:
+                        c = t.add_row().cells
+                        c[0].text, c[1].text, c[2].text = e.date, e.customer, e.correspondence
 
         doc.save(out_path)
 
@@ -1829,14 +2067,13 @@ class ReportApp(tk.Tk):
             spaceBefore=0, spaceAfter=6, fontName="Helvetica-Bold", alignment=1
         ))
         styles.add(ParagraphStyle(name="H1_12", fontSize=12, leading=14, spaceBefore=6, spaceAfter=4, fontName="Helvetica-Bold", leftIndent=0))
-        styles.add(ParagraphStyle(name="H2_11", fontSize=11, leading=13, spaceBefore=6, spaceAfter=4, fontName="Helvetica-Bold", leftIndent=18))  # 0.25"
-        styles.add(ParagraphStyle(name="H3_10", fontSize=10, leading=12, spaceBefore=4, spaceAfter=2, fontName="Helvetica-Bold", leftIndent=36))  # 0.5"
-        styles.add(ParagraphStyle(name="Body10_H2", fontSize=10, leading=12, spaceBefore=0, spaceAfter=4, leftIndent=18)) # align with H2
-        styles.add(ParagraphStyle(name="Body10_H3", fontSize=10, leading=12, spaceBefore=0, spaceAfter=4, leftIndent=36)) # align with H3
+        styles.add(ParagraphStyle(name="H2_11", fontSize=11, leading=13, spaceBefore=6, spaceAfter=4, fontName="Helvetica-Bold", leftIndent=18))
+        styles.add(ParagraphStyle(name="H3_10", fontSize=10, leading=12, spaceBefore=4, spaceAfter=2, fontName="Helvetica-Bold", leftIndent=36))
+        styles.add(ParagraphStyle(name="Body10_H2", fontSize=10, leading=12, spaceBefore=0, spaceAfter=4, leftIndent=18))
+        styles.add(ParagraphStyle(name="Body10_H3", fontSize=10, leading=12, spaceBefore=0, spaceAfter=4, leftIndent=36))
 
         story = []
 
-        # Title
         story.append(Paragraph(f"{r.project_title}", styles["Title14"]))
         story.append(Spacer(1, 0.12 * inch))
 
@@ -1854,175 +2091,195 @@ class ReportApp(tk.Tk):
             t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.25, colors.grey)]))
             story.append(t); story.append(Spacer(1, 0.12 * inch))
 
-        story.append(Paragraph("2. Technical Information", styles["H1_12"]))
+        if include["sec_tech"].get():
+            story.append(Paragraph("2. Technical Information", styles["H1_12"]))
 
-        if include["t_plain"].get():
-            story.append(Paragraph("2.1. Plain Language Summary", styles["H2_11"]))
-            story.append(Paragraph((r.plain_summary or "").replace("\n", "<br/>"), styles["Body10_H2"]))
+            if include["t_plain"].get():
+                story.append(Paragraph("2.1. Plain Language Summary", styles["H2_11"]))
+                story.append(Paragraph((r.plain_summary or "").replace("\n", "<br/>"), styles["Body10_H2"]))
 
-        if include["t_objectives"].get():
-            story.append(Paragraph("2.2. Objectives", styles["H2_11"]))
-            if r.objectives:
-                story.append(ListFlowable([ListItem(Paragraph(o, styles["Body10_H2"])) for o in r.objectives], bulletType="1"))
+            if include["t_objectives"].get():
+                story.append(Paragraph("2.2. Objectives", styles["H2_11"]))
+                if r.objectives:
+                    story.append(ListFlowable([ListItem(Paragraph(o, styles["Body10_H2"])) for o in r.objectives], bulletType="1"))
 
-        if include["t_methods"].get():
-            story.append(Paragraph("2.3. Methods", styles["H2_11"]))
-            if include["t_rm"].get():
-                story.append(Paragraph("2.3.1. Raw Materials", styles["H3_10"]))
-                story.append(ListFlowable([Paragraph(x, styles["Body10_H3"]) for x in r.methods_raw_materials], bulletType="bullet"))
-            if include["t_ins"].get():
-                story.append(Paragraph("2.3.2. Instrument", styles["H3_10"]))
-                story.append(ListFlowable([Paragraph(x, styles["Body10_H3"]) for x in r.methods_instruments], bulletType="bullet"))
-            if include["t_proc"].get():
-                story.append(Paragraph("2.3.3. Experimental Procedure", styles["H3_10"]))
-                story.append(ListFlowable([Paragraph(x, styles["Body10_H3"]) for x in r.methods_procedure], bulletType="bullet"))
-            if include["t_trial"].get():
-                story.append(Paragraph("2.3.4. Trial History", styles["H3_10"]))
-                story.append(Spacer(1, 6))
-                if r.trial_history:
-                    data_th = [["Trial#", "Issue", "Possible Reasons"]] + [[t.number, t.issue, t.reasons] for t in r.trial_history]
-                    tt = Table(data_th, colWidths=[1.0*inch, 2.0*inch, 4.0*inch])
-                    tt.setStyle(TableStyle([
-                        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                        ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
-                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ]))
-                    story.append(tt)
-
-        if include["t_results"].get():
-            story.append(Paragraph("2.4. Results", styles["H2_11"]))
-            for i, it in enumerate(r.results, 1):
-                if it.kind == "text":
-                    story.append(Paragraph(f"2.4.{i}. {it.title}", styles["H3_10"]))
-                    story.append(Paragraph((it.content or "").replace("\n", "<br/>"), styles["Body10_H3"]))
-                elif it.kind == "table":
-                    story.append(Paragraph(f"{it.title}", styles["H3_10"]))
-                    data = it.table_data if it.table_data else parse_table_text(it.content)
-                    if data:
-                        ncols = max(len(rw) for rw in data)
-                        total_w = 7.0 * inch
-                        col_w = [total_w / max(1, ncols)] * ncols
-                        tbl = Table(data, colWidths=col_w)
-                        tbl.setStyle(TableStyle([
+            if include["t_methods"].get():
+                story.append(Paragraph("2.3. Methods", styles["H2_11"]))
+                if include["t_rm"].get():
+                    story.append(Paragraph("2.3.1. Raw Materials", styles["H3_10"]))
+                    story.append(ListFlowable([Paragraph(x, styles["Body10_H3"]) for x in r.methods_raw_materials], bulletType="bullet"))
+                if include["t_ins"].get():
+                    story.append(Paragraph("2.3.2. Instrument", styles["H3_10"]))
+                    story.append(ListFlowable([Paragraph(x, styles["Body10_H3"]) for x in r.methods_instruments], bulletType="bullet"))
+                if include["t_proc"].get():
+                    story.append(Paragraph("2.3.3. Experimental Procedure", styles["H3_10"]))
+                    story.append(ListFlowable([Paragraph(x, styles["Body10_H3"]) for x in r.methods_procedure], bulletType="bullet"))
+                if include["t_trial"].get():
+                    story.append(Paragraph("2.3.4. Trial History", styles["H3_10"]))
+                    story.append(Spacer(1, 6))
+                    if r.trial_history:
+                        data_th = [["Trial#", "Issue", "Possible Reasons"]] + [[t.number, t.issue, t.reasons] for t in r.trial_history]
+                        tt = Table(data_th, colWidths=[1.0*inch, 2.0*inch, 4.0*inch])
+                        tt.setStyle(TableStyle([
                             ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
                             ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
                             ("VALIGN", (0, 0), (-1, -1), "TOP"),
                         ]))
-                        story.append(tbl)
-                    else:
+                        story.append(tt)
+
+            if include["t_results"].get():
+                story.append(Paragraph("2.4. Results", styles["H2_11"]))
+                for i, it in enumerate(r.results, 1):
+                    if it.kind == "text":
+                        story.append(Paragraph(f"2.4.{i}. {it.title}", styles["H3_10"]))
                         story.append(Paragraph((it.content or "").replace("\n", "<br/>"), styles["Body10_H3"]))
-                elif it.kind == "image":
-                    imgs = it.images if it.images else ([it.image_path] if it.image_path else [])
-                    if imgs:
-                        if it.title: story.append(Paragraph(f"{it.title}", styles["H3_10"]))
-                        for pth in imgs:
-                            if pth and os.path.isfile(pth):
-                                story.append(RLImage(pth, width=5.8 * inch, height=3.3 * inch))
-                                if it.caption:
-                                    story.append(Paragraph(it.caption, styles["Body10_H3"]))
+                    elif it.kind == "table":
+                        story.append(Paragraph(f"{it.title}", styles["H3_10"]))
+                        data = it.table_data if it.table_data else parse_table_text(it.content)
+                        if data:
+                            ncols = max(len(rw) for rw in data)
+                            total_w = 7.0 * inch
+                            col_w = [total_w / max(1, ncols)] * ncols
+                            tbl = Table(data, colWidths=col_w)
+                            tbl.setStyle(TableStyle([
+                                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                                ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+                                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                            ]))
+                            story.append(tbl)
+                        else:
+                            story.append(Paragraph((it.content or "").replace("\n", "<br/>"), styles["Body10_H3"]))
+                    elif it.kind == "image":
+                        imgs = it.images if it.images else ([it.image_path] if it.image_path else [])
+                        if imgs:
+                            if it.title: story.append(Paragraph(f"{it.title}", styles["H3_10"]))
+                            for pth in imgs:
+                                if pth and os.path.isfile(pth):
+                                    story.append(RLImage(pth, width=5.8 * inch, height=3.3 * inch))
+                                    if it.caption:
+                                        story.append(Paragraph(it.caption, styles["Body10_H3"]))
 
-        if include["t_conc"].get():
-            story.append(Paragraph("2.5. Conclusion", styles["H2_11"]))
-            story.append(ListFlowable([Paragraph(x, styles["Body10_H2"]) for x in r.conclusion], bulletType="bullet"))
+            if include["t_conc"].get():
+                story.append(Paragraph("2.5. Conclusion", styles["H2_11"]))
+                story.append(ListFlowable([Paragraph(x, styles["Body10_H2"]) for x in r.conclusion], bulletType="bullet"))
 
-        if include["t_misc"].get():
-            story.append(Paragraph("2.6. Miscellaneous", styles["H2_11"]))
-            story.append(Paragraph((r.miscellaneous or "").replace("\n", "<br/>"), styles["Body10_H2"]))
+            if include["t_refs"].get():
+                story.append(Paragraph("2.6. References", styles["H2_11"]))
+                story.append(ListFlowable([Paragraph(x, styles["Body10_H2"]) for x in r.references], bulletType="bullet"))
 
-        if include["t_refs"].get():
-            story.append(Paragraph("2.7. References", styles["H2_11"]))
-            story.append(ListFlowable([Paragraph(x, styles["Body10_H2"]) for x in r.references], bulletType="bullet"))
+            if include["t_misc"].get():
+                story.append(Paragraph("2.7. Miscellaneous", styles["H2_11"]))
+                for i, m in enumerate(r.miscellaneous_items, 1):
+                    story.append(Paragraph(f"2.7.{i}. {m.title}", styles["H3_10"]))
+                    story.append(Paragraph((m.content or "").replace("\n","<br/>"), styles["Body10_H3"]))
 
         if include["sec_reg"].get():
             story.append(Paragraph("3. Regulatory", styles["H1_12"]))
-            story.append(Paragraph("3.1. Application regulations", styles["H2_11"]))
-            story.append(Paragraph((r.regulations or "").replace("\n", "<br/>"), styles["Body10_H2"]))
-            story.append(Paragraph("3.2. Label Requirements", styles["H2_11"]))
-            story.append(Paragraph((r.label_req or "").replace("\n", "<br/>"), styles["Body10_H2"]))
-            story.append(Paragraph("3.3. Certification Requirements", styles["H2_11"]))
-            story.append(Paragraph((r.certification_req or "").replace("\n", "<br/>"), styles["Body10_H2"]))
+            if include["reg_31"].get():
+                story.append(Paragraph("3.1. Application regulations", styles["H2_11"]))
+                story.append(Paragraph((r.regulations or "").replace("\n", "<br/>"), styles["Body10_H2"]))
+            if include["reg_32"].get():
+                story.append(Paragraph("3.2. Label Requirements", styles["H2_11"]))
+                story.append(Paragraph((r.label_req or "").replace("\n", "<br/>"), styles["Body10_H2"]))
+            if include["reg_33"].get():
+                story.append(Paragraph("3.3. Certification Requirements", styles["H2_11"]))
+                story.append(Paragraph((r.certification_req or "").replace("\n", "<br/>"), styles["Body10_H2"]))
 
-        # 4. Scale Up
         if include["sec_scale"].get():
             story.append(Paragraph("4. Scale Up", styles["H1_12"]))
-
-            story.append(Paragraph("4.1. Manufacturing Order", styles["H2_11"]))
-            if r.manuf_order_steps:
-                story.append(ListFlowable([Paragraph(x, styles["Body10_H2"]) for x in r.manuf_order_steps],
-                                          bulletType="bullet"))
-
-            story.append(Paragraph("4.2. Formulation Risk", styles["H2_11"]))
-            story.append(Paragraph((r.formulation_risk_text or "").replace("\n","<br/>"), styles["Body10_H2"]))
-
-            story.append(Paragraph("4.3. Hazards", styles["H2_11"]))
-            story.append(Paragraph((r.hazards_text or "").replace("\n","<br/>"), styles["Body10_H2"]))
-
-            story.append(Paragraph("4.4. Equipment", styles["H2_11"]))
-            story.append(Paragraph((r.equipment_text or "").replace("\n","<br/>"), styles["Body10_H2"]))
-
-            story.append(Paragraph("4.5. CAPEX Requirements", styles["H2_11"]))
-            story.append(Paragraph((r.capex_text or "").replace("\n","<br/>"), styles["Body10_H2"]))
-
-            story.append(Paragraph("4.6. Safety Assessment", styles["H2_11"]))
-            story.append(Paragraph((r.safety_assess_text or "").replace("\n","<br/>"), styles["Body10_H2"]))
+            if include["s_41"].get():
+                story.append(Paragraph("4.1. Manufacturing Order", styles["H2_11"]))
+                if r.manuf_order_steps:
+                    story.append(ListFlowable([Paragraph(x, styles["Body10_H2"]) for x in r.manuf_order_steps],
+                                              bulletType="bullet"))
+            if include["s_42"].get():
+                story.append(Paragraph("4.2. Formulation Risk", styles["H2_11"]))
+                story.append(Paragraph((r.formulation_risk_text or "").replace("\n","<br/>"), styles["Body10_H2"]))
+            if include["s_43"].get():
+                story.append(Paragraph("4.3. Hazards", styles["H2_11"]))
+                story.append(Paragraph((r.hazards_text or "").replace("\n","<br/>"), styles["Body10_H2"]))
+            if include["s_44"].get():
+                story.append(Paragraph("4.4. Equipment", styles["H2_11"]))
+                story.append(Paragraph((r.equipment_text or "").replace("\n","<br/>"), styles["Body10_H2"]))
+            if include["s_45"].get():
+                story.append(Paragraph("4.5. CAPEX Requirements", styles["H2_11"]))
+                story.append(Paragraph((r.capex_text or "").replace("\n","<br/>"), styles["Body10_H2"]))
+            if include["s_46"].get():
+                story.append(Paragraph("4.6. Safety Assessment", styles["H2_11"]))
+                story.append(Paragraph((r.safety_assess_text or "").replace("\n","<br/>"), styles["Body10_H2"]))
 
         if include["sec_quality"].get():
             story.append(Paragraph("5. Quality", styles["H1_12"]))
-            story.append(Paragraph("5.1. Raw Material Sourcing", styles["H2_11"]))
-            story.append(Paragraph((r.raw_material_sourcing or "").replace("\n", "<br/>"), styles["Body10_H2"]))
-            story.append(Paragraph("5.2. LIMS Setup", styles["H2_11"]))
-            story.append(Paragraph((r.lims_setup or "").replace("\n", "<br/>"), styles["Body10_H2"]))
-            story.append(Paragraph("5.3. Stability Testing", styles["H2_11"]))
-            story.append(Paragraph((r.stability_testing or "").replace("\n", "<br/>"), styles["Body10_H2"]))
-            story.append(Paragraph("5.4. Packaging Compatibility", styles["H2_11"]))
-            story.append(Paragraph((r.packaging_compatibility or "").replace("\n", "<br/>"), styles["Body10_H2"]))
+            if include["q_51"].get():
+                story.append(Paragraph("5.1. Raw Material Sourcing", styles["H2_11"]))
+                story.append(Paragraph((r.raw_material_sourcing or "").replace("\n", "<br/>"), styles["Body10_H2"]))
+            if include["q_52"].get():
+                story.append(Paragraph("5.2. LIMS Setup", styles["H2_11"]))
+                story.append(Paragraph((r.lims_setup or "").replace("\n", "<br/>"), styles["Body10_H2"]))
+            if include["q_53"].get():
+                story.append(Paragraph("5.3. Stability Testing", styles["H2_11"]))
+                story.append(Paragraph((r.stability_testing or "").replace("\n", "<br/>"), styles["Body10_H2"]))
+            if include["q_54"].get():
+                story.append(Paragraph("5.4. Packaging Compatibility", styles["H2_11"]))
+                story.append(Paragraph((r.packaging_compatibility or "").replace("\n", "<br/>"), styles["Body10_H2"]))
 
         if include["sec_commercial"].get():
             story.append(Paragraph("6. Commercial", styles["H1_12"]))
-            story.append(Paragraph("6.1. Customer Objectives / Problem Statement", styles["H2_11"]))
-            story.append(Paragraph((r.c_obj_problem or "").replace("\n","<br/>"), styles["Body10_H2"]))
-            story.append(Paragraph("6.2. SMART Success Criteria", styles["H2_11"]))
-            for key,label in [("S","Specific"),("M","Measurable"),("A","Achievable"),("R","Relevant"),("T","Time-bound")]:
-                val = r.smart_goals.get(key,"").strip()
-                if val:
-                    story.append(Paragraph(f"{label}: {val}", styles["Body10_H3"]))
-            story.append(Paragraph("6.3. Customer Specifications", styles["H2_11"]))
-            story.append(Paragraph((r.c_specs or "").replace("\n","<br/>"), styles["Body10_H2"]))
-            story.append(Paragraph("6.4. Expected Business Volume", styles["H2_11"]))
-            story.append(Paragraph((r.c_expected_volume or "").replace("\n","<br/>"), styles["Body10_H2"]))
-            story.append(Paragraph("6.5. Packaging Requirement", styles["H2_11"]))
-            story.append(Paragraph((r.c_packaging_req or "").replace("\n","<br/>"), styles["Body10_H2"]))
-            story.append(Paragraph("6.6. Raw Material Restrictions / Preferences", styles["H2_11"]))
-            story.append(Paragraph((r.c_raw_material_prefs or "").replace("\n","<br/>"), styles["Body10_H2"]))
-            story.append(Paragraph("6.7. Sample Needed", styles["H2_11"]))
-            story.append(Paragraph((r.c_sample_needed or "").replace("\n","<br/>"), styles["Body10_H2"]))
-            story.append(Paragraph("6.8. Opportunity Timeline", styles["H2_11"]))
-            story.append(Paragraph((r.c_opportunity_timeline or "").replace("\n","<br/>"), styles["Body10_H2"]))
-            story.append(Paragraph("6.9. Target Application", styles["H2_11"]))
-            story.append(Paragraph((r.target_application or "").replace("\n","<br/>"), styles["Body10_H2"]))
-            story.append(Paragraph("6.10. Customer Feedback", styles["H2_11"]))
-            story.append(Paragraph((r.customer_feedback or "").replace("\n","<br/>"), styles["Body10_H2"]))
-            story.append(Paragraph("6.11. TDS Development", styles["H2_11"]))
-            story.append(Paragraph((r.tds_development or "").replace("\n","<br/>"), styles["Body10_H2"]))
-            story.append(Paragraph("6.12. Email Correspondence", styles["H2_11"]))
-            if r.email_correspondence:
-                data = [["Date","Customer Name","Correspondence"]] + [[e.date, e.customer, e.correspondence] for e in r.email_correspondence]
-                tt = Table(data, colWidths=[1.3*inch, 2.0*inch, 3.7*inch])
-                tt.setStyle(TableStyle([
-                    ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
-                    ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
-                    ("VALIGN", (0,0), (-1,-1), "TOP"),
-                ]))
-                story.append(tt)
+            if include["c_61"].get():
+                story.append(Paragraph("6.1. Customer Objectives / Problem Statement", styles["H2_11"]))
+                story.append(Paragraph((r.c_obj_problem or "").replace("\n","<br/>"), styles["Body10_H2"]))
+            if include["c_62"].get():
+                story.append(Paragraph("6.2. SMART Success Criteria", styles["H2_11"]))
+                for key,label in [("S","Specific"),("M","Measurable"),("A","Achievable"),("R","Relevant"),("T","Time-bound")]:
+                    val = r.smart_goals.get(key,"").strip()
+                    if val:
+                        story.append(Paragraph(f"{label}: {val}", styles["Body10_H3"]))
+            if include["c_63"].get():
+                story.append(Paragraph("6.3. Customer Specifications", styles["H2_11"]))
+                story.append(Paragraph((r.c_specs or "").replace("\n","<br/>"), styles["Body10_H2"]))
+            if include["c_64"].get():
+                story.append(Paragraph("6.4. Expected Business Volume", styles["H2_11"]))
+                story.append(Paragraph((r.c_expected_volume or "").replace("\n","<br/>"), styles["Body10_H2"]))
+            if include["c_65"].get():
+                story.append(Paragraph("6.5. Packaging Requirement", styles["H2_11"]))
+                story.append(Paragraph((r.c_packaging_req or "").replace("\n","<br/>"), styles["Body10_H2"]))
+            if include["c_66"].get():
+                story.append(Paragraph("6.6. Raw Material Restrictions / Preferences", styles["H2_11"]))
+                story.append(Paragraph((r.c_raw_material_prefs or "").replace("\n","<br/>"), styles["Body10_H2"]))
+            if include["c_67"].get():
+                story.append(Paragraph("6.7. Sample Needed", styles["H2_11"]))
+                story.append(Paragraph((r.c_sample_needed or "").replace("\n","<br/>"), styles["Body10_H2"]))
+            if include["c_68"].get():
+                story.append(Paragraph("6.8. Opportunity Timeline", styles["H2_11"]))
+                story.append(Paragraph((r.c_opportunity_timeline or "").replace("\n","<br/>"), styles["Body10_H2"]))
+            if include["c_69"].get():
+                story.append(Paragraph("6.9. Target Application", styles["H2_11"]))
+                story.append(Paragraph((r.target_application or "").replace("\n","<br/>"), styles["Body10_H2"]))
+            if include["c_610"].get():
+                story.append(Paragraph("6.10. Customer Feedback", styles["H2_11"]))
+                story.append(Paragraph((r.customer_feedback or "").replace("\n","<br/>"), styles["Body10_H2"]))
+            if include["c_611"].get():
+                story.append(Paragraph("6.11. TDS Development", styles["H2_11"]))
+                story.append(Paragraph((r.tds_development or "").replace("\n","<br/>"), styles["Body10_H2"]))
+            if include["c_612"].get():
+                story.append(Paragraph("6.12. Email Correspondence", styles["H2_11"]))
+                if r.email_correspondence:
+                    data = [["Date","Customer Name","Correspondence"]] + [[e.date, e.customer, e.correspondence] for e in r.email_correspondence]
+                    tt = Table(data, colWidths=[1.3*inch, 2.0*inch, 3.7*inch])
+                    tt.setStyle(TableStyle([
+                        ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+                        ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
+                        ("VALIGN", (0,0), (-1,-1), "TOP"),
+                    ]))
+                    story.append(tt)
 
         def on_page(canvas, doc_obj):
-            # Header band at the very top region
             if header_img and os.path.isfile(header_img):
                 try:
                     canvas.drawImage(
                         header_img,
                         x=doc_obj.leftMargin,
-                        y=doc_obj.pagesize[1] - 0.85 * inch,  # near top edge
+                        y=doc_obj.pagesize[1] - 0.85 * inch,
                         width=doc_obj.width,
                         height=0.5 * inch,
                         preserveAspectRatio=True,
@@ -2031,7 +2288,6 @@ class ReportApp(tk.Tk):
                 except Exception:
                     pass
 
-            # Footer band near bottom + page number
             if footer_img and os.path.isfile(footer_img):
                 try:
                     canvas.drawImage(
@@ -2050,14 +2306,13 @@ class ReportApp(tk.Tk):
             canvas.setFont("Helvetica", 9)
             canvas.drawRightString(doc_obj.pagesize[0]-doc_obj.rightMargin, 0.25 * inch, f"{page_num}")
 
-        # Leave space for header/footer bands
         doc = SimpleDocTemplate(
             out_path,
             pagesize=A4,
             leftMargin=0.75 * inch,
             rightMargin=0.75 * inch,
-            topMargin=1.35 * inch,     # room for header band
-            bottomMargin=1.2 * inch    # room for footer band
+            topMargin=1.35 * inch,
+            bottomMargin=1.2 * inch
         )
         doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
         messagebox.showinfo("PDF saved", f"Saved: {out_path}")
