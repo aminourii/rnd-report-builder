@@ -1,5 +1,3 @@
-pyinstaller
-pillow
 os
 sys
 csv
@@ -11,4 +9,4 @@ uuid
 dataclasses
 typing
 tkinter
-
+docx

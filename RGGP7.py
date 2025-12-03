@@ -8,6 +8,10 @@ import tempfile
 import uuid
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict
+from docx import Document
+from docx2pdf import convert
+from reportlab.pdfgen import canvas
+
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -482,8 +486,12 @@ class ReportApp(tk.Tk):
 
         self.current_file_path: Optional[str] = None
 
-        # init master include dict  >>> MOVED UP <<<
+        # init master include dict
         self.include = {}
+
+        # Custom report options
+        self.custom_scaleup_var = tk.BooleanVar(value=False)
+        self._include_container: Optional[tk.Widget] = None
 
         self._include_state_keys = [
             # Section 1
@@ -518,7 +526,7 @@ class ReportApp(tk.Tk):
 
         self._make_menubar()
         self._branding_bar()
-        self._build_ui()   # safe now, self.include exists
+        self._build_ui()
         self._wire_focus_tracking()
 
         self.bind_all("<Control-n>", lambda e: self._file_new())
@@ -1240,7 +1248,6 @@ class ReportApp(tk.Tk):
         self._watch_widget(txt)
         return frame, txt
 
-
     def _smart_goal_row(self, parent, key, title, ii_text):
         row = ttk.Frame(parent)
         ttk.Label(row, text=f"{title}:", width=12, anchor="w").pack(side=tk.LEFT)
@@ -1440,7 +1447,14 @@ class ReportApp(tk.Tk):
         for v, lab in [("docx", "DOCX"), ("pdf", "PDF"), ("both", "Both")]:
             ttk.Radiobutton(fmt, text=lab, variable=self.export_fmt, value=v).pack(side=tk.LEFT, padx=6)
 
-        chooser = ttk.Labelframe(tab, text="Include in output"); chooser.pack(fill="both", expand=True, pady=(6, 10))
+        # --- Side-by-side: Include in output  +  Custom Reports ---
+        panels = ttk.Frame(tab)
+        panels.pack(fill="both", expand=True)
+
+        # LEFT: Include in output
+        chooser = ttk.Labelframe(panels, text="Include in output")
+        chooser.pack(side=tk.LEFT, fill="both", expand=True, pady=(6, 10), padx=(0, 6))
+        self._include_container = chooser  # used for enable/disable
 
         # helper to make/check include vars
         def mkvar(key, default=True):
@@ -1453,8 +1467,12 @@ class ReportApp(tk.Tk):
         # --- Select / Deselect All ---
         master_row = ttk.Frame(chooser); master_row.pack(fill="x", pady=(6, 4))
         self._master_select = tk.BooleanVar(value=True)
-        ttk.Checkbutton(master_row, text="Select / Deselect All", variable=self._master_select,
-                        command=lambda: self._toggle_all(self._master_select.get())).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            master_row,
+            text="Select / Deselect All",
+            variable=self._master_select,
+            command=lambda: self._toggle_all(self._master_select.get())
+        ).pack(side=tk.LEFT)
 
         ttk.Separator(chooser, orient="horizontal").pack(fill="x", pady=4)
 
@@ -1523,6 +1541,22 @@ class ReportApp(tk.Tk):
         ttk.Checkbutton(sec6.body, text="6.11. TDS Development", variable=mkvar("c_611", True)).pack(anchor="w")
         ttk.Checkbutton(sec6.body, text="6.12. Email Correspondence", variable=mkvar("c_612", True)).pack(anchor="w")
 
+        # RIGHT: Custom Reports
+        custom = ttk.Labelframe(panels, text="Custom Reports")
+        custom.pack(side=tk.LEFT, fill="y", pady=(6, 10))
+
+        ttk.Label(
+            custom,
+            text="Generate tailored reports in addition\nto the full report."
+        ).pack(anchor="w", padx=6, pady=(6, 4))
+
+        ttk.Checkbutton(
+            custom,
+            text="Scale Up Report (General + Technical + Scale Up, renumbered)",
+            variable=self.custom_scaleup_var,
+            command=self._on_custom_report_toggle,
+        ).pack(anchor="w", padx=6, pady=(0, 6))
+
         out = ttk.Frame(tab); out.pack(fill="x", pady=6)
         ttk.Label(out, text="Output folder:").pack(side=tk.LEFT)
         self.out_dir_var = tk.StringVar(value=os.path.join(app_writable_dir(), "reports"))
@@ -1537,12 +1571,42 @@ class ReportApp(tk.Tk):
         for k in self._include_state_keys:
             mkvar(k, True).set(True)
 
+        # Make sure Include panel is enabled initially
+        self._set_include_enabled(True)
+
     def _toggle_all(self, state: bool):
         for key, var in self.include.items():
             try:
                 var.set(state)
             except Exception:
                 pass
+
+    def _set_include_enabled(self, enabled: bool):
+        """
+        Enable/disable the 'Include in output' panel.
+        This only affects the UI; the underlying BooleanVars are still honored.
+        """
+        if not getattr(self, "_include_container", None):
+            return
+        state = "normal" if enabled else "disabled"
+
+        def walk(widget):
+            for child in widget.winfo_children():
+                try:
+                    child.configure(state=state)
+                except Exception:
+                    pass
+                walk(child)
+
+        walk(self._include_container)
+
+    def _on_custom_report_toggle(self):
+        """
+        When a custom report (e.g., Scale Up Report) is selected,
+        gray out the 'Include in output' chooser so users know
+        it does NOT control the custom report composition.
+        """
+        self._set_include_enabled(not self.custom_scaleup_var.get())
 
     # ---------- Objectives rows ----------
     def _add_objective_row(self):
@@ -2054,6 +2118,162 @@ class ReportApp(tk.Tk):
 
         doc.save(out_path)
 
+    def _export_docx_scaleup(self, r: ReportModel, out_path: str,
+                             header_img: Optional[str], footer_img: Optional[str]):
+        """
+        Custom DOCX: Scale Up Report for Manufacturing
+        Includes ONLY:
+          1. General Information
+          2. Technical Information
+          3. Scale Up
+        with section numbers renumbered to 1, 2, 3 (and 3.x for Scale Up).
+        """
+        if Document is None:
+            messagebox.showerror("python-docx not found", "Install python-docx to export .docx")
+            return
+
+        doc = Document()
+        self._add_header_docx(doc, header_img)
+        self._add_page_number_footer_docx(doc, footer_img)
+
+        # Title
+        p = doc.add_paragraph()
+        run = p.add_run(f"{r.project_title} — Scale Up Report")
+        run.bold = True
+        run.font.size = Pt(14)
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        # 1. General
+        self._H1(doc, "\n1. General Information")
+        table = doc.add_table(rows=0, cols=2)
+        def add_row(k, v):
+            row = table.add_row().cells
+            row[0].text = k
+            row[1].text = v
+        add_row("Start Date", r.start_date)
+        add_row("Report Date", r.report_date)
+        add_row("Assigned By", r.assigned_by)
+        add_row("Bin No", r.bin_no)
+        add_row("Researcher Name", r.researcher_name)
+        add_row("Total Hours", r.total_hours)
+
+        # 2. Technical
+        self._H1(doc, "\n2. Technical Information")
+
+        # 2.1 Plain summary
+        self._H2(doc, "2.1. Plain Language Summary")
+        self._body_para(doc, r.plain_summary, level=2)
+
+        # 2.2 Objectives
+        self._H2(doc, "2.2. Objectives")
+        for it in r.objectives:
+            self._list_para(doc, it, numbered=True, level=2)
+
+        # 2.3 Methods
+        self._H2(doc, "2.3. Methods")
+        # 2.3.1 Raw Materials
+        self._H3(doc, "2.3.1. Raw Materials")
+        for x in r.methods_raw_materials:
+            self._list_para(doc, x, numbered=False, level=3)
+        # 2.3.2 Instrument
+        self._H3(doc, "2.3.2. Instrument")
+        for x in r.methods_instruments:
+            self._list_para(doc, x, numbered=False, level=3)
+        # 2.3.3 Procedure
+        self._H3(doc, "2.3.3. Experimental Procedure")
+        for x in r.methods_procedure:
+            self._list_para(doc, x, numbered=False, level=3)
+        # 2.3.4 Trial History
+        self._H3(doc, "2.3.4. Trial History")
+        if r.trial_history:
+            t = doc.add_table(rows=1, cols=3)
+            try:
+                t.style = r.trial_docx_style
+            except Exception:
+                t.style = "Table Grid"
+            hdr = t.rows[0].cells
+            hdr[0].text, hdr[1].text, hdr[2].text = "Trial#", "Issue", "Possible Reasons"
+            for tr in r.trial_history:
+                c = t.add_row().cells
+                c[0].text, c[1].text, c[2].text = tr.number, tr.issue, tr.reasons
+
+        # 2.4 Results
+        self._H2(doc, "2.4. Results")
+        for idx, it in enumerate(r.results, 1):
+            if it.kind == "text":
+                self._H3(doc, f"2.4.{idx}. {it.title}")
+                for line in safe_split_lines(it.content):
+                    self._body_para(doc, line, level=3)
+            elif it.kind == "table":
+                self._H3(doc, f"{it.title}")
+                data = it.table_data if it.table_data else parse_table_text(it.content)
+                if data:
+                    rows = len(data)
+                    cols = max(len(rw) for rw in data)
+                    tb = doc.add_table(rows=rows, cols=cols)
+                    try:
+                        tb.style = it.table_style
+                    except Exception:
+                        tb.style = "Table Grid"
+                    for r_i, row in enumerate(data):
+                        for c_i in range(cols):
+                            tb.cell(r_i, c_i).text = row[c_i] if c_i < len(row) else ""
+            elif it.kind == "image":
+                imgs = it.images if it.images else ([it.image_path] if it.image_path else [])
+                if imgs:
+                    if it.title:
+                        self._H3(doc, f"{it.title}")
+                    for pth in imgs:
+                        if pth and os.path.isfile(pth):
+                            try:
+                                doc.add_picture(pth, width=Inches(5.8))
+                            except Exception:
+                                continue
+                            if it.caption:
+                                pcap = doc.add_paragraph(it.caption)
+                                pcap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                                pcap.paragraph_format.left_indent = Inches(0.5)
+
+        # 2.5 Conclusion
+        self._H2(doc, "2.5. Conclusion")
+        for x in r.conclusion:
+            self._list_para(doc, x, numbered=False, level=2)
+
+        # 2.6 References
+        self._H2(doc, "2.6. References")
+        for x in r.references:
+            self._list_para(doc, x, numbered=False, level=2)
+
+        # 3. Scale Up (renumbered from 4.x -> 3.x)
+        self._H1(doc, "\n3. Scale Up")
+
+        # 3.1 Manufacturing Order
+        self._H2(doc, "3.1. Manufacturing Order")
+        for step in r.manuf_order_steps:
+            self._list_para(doc, step, numbered=False, level=2)
+
+        # 3.2 Formulation Risk
+        self._H2(doc, "3.2. Formulation Risk")
+        self._body_para(doc, r.formulation_risk_text, level=2)
+
+        # 3.3 Hazards
+        self._H2(doc, "3.3. Hazards")
+        self._body_para(doc, r.hazards_text, level=2)
+
+        # 3.4 Equipment
+        self._H2(doc, "3.4. Equipment")
+        self._body_para(doc, r.equipment_text, level=2)
+
+        # 3.5 CAPEX Requirements
+        self._H2(doc, "3.5. CAPEX Requirements")
+        self._body_para(doc, r.capex_text, level=2)
+
+        # 3.6 Safety Assessment
+        self._H2(doc, "3.6. Safety Assessment")
+        self._body_para(doc, r.safety_assess_text, level=2)
+
+        doc.save(out_path)
+
     # -------------------------- PDF export (ReportLab) ------------------------
     def _export_pdf_basic(self, r: ReportModel, out_path: str, header_img: Optional[str], footer_img: Optional[str]):
         if SimpleDocTemplate is None:
@@ -2317,21 +2537,433 @@ class ReportApp(tk.Tk):
         doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
         messagebox.showinfo("PDF saved", f"Saved: {out_path}")
 
+    # -------------------------- Custom Scale-Up DOCX export -------------------
+    def _export_docx_scaleup(self, r: ReportModel, out_path: str, header_img: Optional[str], footer_img: Optional[str]):
+        """
+        Custom 'Scale Up Report' for Manufacturing:
+        - Includes sections 1 (General), 2 (Technical), and 4 (Scale Up)
+        - Renumbers Scale Up to be section 3 in this custom document.
+        - Respects the existing include[] flags for what content to show.
+        """
+        if Document is None:
+            messagebox.showerror("python-docx not found", "Install python-docx to export Scale Up DOCX")
+            return
+
+        include = self.include
+        doc = Document()
+
+        self._add_header_docx(doc, header_img)
+        self._add_page_number_footer_docx(doc, footer_img)
+
+        # Title
+        p = doc.add_paragraph()
+        run = p.add_run(f"{r.project_title} — Scale Up Report")
+        run.bold = True
+        run.font.size = Pt(14)
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        # --- 1. General ---
+        if include["sec_general"].get():
+            self._H1(doc, "\n1. General Information")
+            table = doc.add_table(rows=0, cols=2)
+
+            def add_row(k, v):
+                row = table.add_row().cells
+                row[0].text = k
+                row[1].text = v
+
+            add_row("Start Date", r.start_date)
+            add_row("Report Date", r.report_date)
+            add_row("Assigned By", r.assigned_by)
+            add_row("Bin No", r.bin_no)
+            add_row("Researcher Name", r.researcher_name)
+            add_row("Total Hours", r.total_hours)
+
+        # --- 2. Technical (same content, numbering preserved under section 2) ---
+        if include["sec_tech"].get():
+            self._H1(doc, "\n2. Technical Information")
+
+            if include["t_plain"].get():
+                self._H2(doc, "2.1. Plain Language Summary")
+                self._body_para(doc, r.plain_summary, level=2)
+
+            if include["t_objectives"].get():
+                self._H2(doc, "2.2. Objectives")
+                for it in r.objectives:
+                    self._list_para(doc, it, numbered=True, level=2)
+
+            if include["t_methods"].get():
+                self._H2(doc, "2.3. Methods")
+                if include["t_rm"].get():
+                    self._H3(doc, "2.3.1. Raw Materials")
+                    for x in r.methods_raw_materials:
+                        self._list_para(doc, x, numbered=False, level=3)
+                if include["t_ins"].get():
+                    self._H3(doc, "2.3.2. Instrument")
+                    for x in r.methods_instruments:
+                        self._list_para(doc, x, numbered=False, level=3)
+                if include["t_proc"].get():
+                    self._H3(doc, "2.3.3. Experimental Procedure")
+                    for x in r.methods_procedure:
+                        self._list_para(doc, x, numbered=False, level=3)
+                if include["t_trial"].get():
+                    self._H3(doc, "2.3.4. Trial History")
+                    if r.trial_history:
+                        t = doc.add_table(rows=1, cols=3)
+                        try:
+                            t.style = r.trial_docx_style
+                        except Exception:
+                            t.style = "Table Grid"
+                        hdr = t.rows[0].cells
+                        hdr[0].text, hdr[1].text, hdr[2].text = "Trial#", "Issue", "Possible Reasons"
+                        for tr in r.trial_history:
+                            c = t.add_row().cells
+                            c[0].text, c[1].text, c[2].text = tr.number, tr.issue, tr.reasons
+
+            if include["t_results"].get():
+                self._H2(doc, "2.4. Results")
+                for idx, it in enumerate(r.results, 1):
+                    if it.kind == "text":
+                        self._H3(doc, f"2.4.{idx}. {it.title}")
+                        for line in safe_split_lines(it.content):
+                            self._body_para(doc, line, level=3)
+                    elif it.kind == "table":
+                        self._H3(doc, f"{it.title}")
+                        data = it.table_data if it.table_data else parse_table_text(it.content)
+                        if data:
+                            rows = len(data)
+                            cols = max(len(rw) for rw in data)
+                            tb = doc.add_table(rows=rows, cols=cols)
+                            try:
+                                tb.style = it.table_style
+                            except Exception:
+                                tb.style = "Table Grid"
+                            for r_i, row in enumerate(data):
+                                for c_i in range(cols):
+                                    tb.cell(r_i, c_i).text = row[c_i] if c_i < len(row) else ""
+                    elif it.kind == "image":
+                        imgs = it.images if it.images else ([it.image_path] if it.image_path else [])
+                        if imgs:
+                            if it.title:
+                                self._H3(doc, f"{it.title}")
+                            for pth in imgs:
+                                if pth and os.path.isfile(pth):
+                                    try:
+                                        doc.add_picture(pth, width=Inches(5.8))
+                                    except Exception:
+                                        continue
+                                    if it.caption:
+                                        pcap = doc.add_paragraph(it.caption)
+                                        pcap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                                        pcap.paragraph_format.left_indent = Inches(0.5)
+
+            if include["t_conc"].get():
+                self._H2(doc, "2.5. Conclusion")
+                for x in r.conclusion:
+                    self._list_para(doc, x, numbered=False, level=2)
+
+            if include["t_refs"].get():
+                self._H2(doc, "2.6. References")
+                for x in r.references:
+                    self._list_para(doc, x, numbered=False, level=2)
+
+            if include["t_misc"].get():
+                self._H2(doc, "2.7. Miscellaneous")
+                for i, m in enumerate(r.miscellaneous_items, 1):
+                    self._H3(doc, f"2.7.{i}. {m.title}")
+                    self._body_para(doc, m.content, level=3)
+
+        # --- 3. Scale Up (renumbered from 4.x to 3.x) ---
+        if include["sec_scale"].get():
+            self._H1(doc, "\n3. Scale Up")
+            if include["s_41"].get():
+                self._H2(doc, "3.1. Manufacturing Order")
+                for step in r.manuf_order_steps:
+                    self._list_para(doc, step, numbered=False, level=2)
+            if include["s_42"].get():
+                self._H2(doc, "3.2. Formulation Risk")
+                self._body_para(doc, r.formulation_risk_text, level=2)
+            if include["s_43"].get():
+                self._H2(doc, "3.3. Hazards")
+                self._body_para(doc, r.hazards_text, level=2)
+            if include["s_44"].get():
+                self._H2(doc, "3.4. Equipment")
+                self._body_para(doc, r.equipment_text, level=2)
+            if include["s_45"].get():
+                self._H2(doc, "3.5. CAPEX Requirements")
+                self._body_para(doc, r.capex_text, level=2)
+            if include["s_46"].get():
+                self._H2(doc, "3.6. Safety Assessment")
+                self._body_para(doc, r.safety_assess_text, level=2)
+
+        doc.save(out_path)
+
+    # -------------------------- Custom Scale-Up PDF export --------------------
+    def _export_pdf_scaleup(self, r: ReportModel, out_path: str, header_img: Optional[str], footer_img: Optional[str]):
+        """
+        PDF equivalent of the custom Scale Up report:
+        - Sections 1, 2, and 3 (3 is renumbered Scale Up).
+        """
+        if SimpleDocTemplate is None:
+            messagebox.showerror("reportlab not found", "Install reportlab to export Scale Up PDF.")
+            return
+
+        include = self.include
+        styles = getSampleStyleSheet()
+        styles.add(ParagraphStyle(
+            name="Title14_SU", parent=styles["Title"], fontSize=14, leading=16,
+            spaceBefore=0, spaceAfter=6, fontName="Helvetica-Bold", alignment=1
+        ))
+        styles.add(ParagraphStyle(name="SU_H1_12", fontSize=12, leading=14, spaceBefore=6, spaceAfter=4,
+                                  fontName="Helvetica-Bold", leftIndent=0))
+        styles.add(ParagraphStyle(name="SU_H2_11", fontSize=11, leading=13, spaceBefore=6, spaceAfter=4,
+                                  fontName="Helvetica-Bold", leftIndent=18))
+        styles.add(ParagraphStyle(name="SU_H3_10", fontSize=10, leading=12, spaceBefore=4, spaceAfter=2,
+                                  fontName="Helvetica-Bold", leftIndent=36))
+        styles.add(ParagraphStyle(name="SU_Body10_H2", fontSize=10, leading=12, spaceBefore=0, spaceAfter=4,
+                                  leftIndent=18))
+        styles.add(ParagraphStyle(name="SU_Body10_H3", fontSize=10, leading=12, spaceBefore=0, spaceAfter=4,
+                                  leftIndent=36))
+
+        story = []
+        story.append(Paragraph(f"{r.project_title} — Scale Up Report", styles["Title14_SU"]))
+        story.append(Spacer(1, 0.12 * inch))
+
+        # 1. General
+        if include["sec_general"].get():
+            story.append(Paragraph("1. General Information", styles["SU_H1_12"]))
+            data = [
+                ["Start Date", r.start_date],
+                ["Report Date", r.report_date],
+                ["Assigned By", r.assigned_by],
+                ["Bin No", r.bin_no],
+                ["Researcher Name", r.researcher_name],
+                ["Total Hours", r.total_hours],
+            ]
+            t = Table(data, colWidths=[2.2 * inch, 4.8 * inch])
+            t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.25, colors.grey)]))
+            story.append(t)
+            story.append(Spacer(1, 0.12 * inch))
+
+        # 2. Technical
+        if include["sec_tech"].get():
+            story.append(Paragraph("2. Technical Information", styles["SU_H1_12"]))
+
+            if include["t_plain"].get():
+                story.append(Paragraph("2.1. Plain Language Summary", styles["SU_H2_11"]))
+                story.append(Paragraph((r.plain_summary or "").replace("\n", "<br/>"), styles["SU_Body10_H2"]))
+
+            if include["t_objectives"].get():
+                story.append(Paragraph("2.2. Objectives", styles["SU_H2_11"]))
+                if r.objectives:
+                    story.append(
+                        ListFlowable(
+                            [ListItem(Paragraph(o, styles["SU_Body10_H2"])) for o in r.objectives],
+                            bulletType="1"
+                        )
+                    )
+
+            if include["t_methods"].get():
+                story.append(Paragraph("2.3. Methods", styles["SU_H2_11"]))
+                if include["t_rm"].get():
+                    story.append(Paragraph("2.3.1. Raw Materials", styles["SU_H3_10"]))
+                    story.append(
+                        ListFlowable(
+                            [Paragraph(x, styles["SU_Body10_H3"]) for x in r.methods_raw_materials],
+                            bulletType="bullet"
+                        )
+                    )
+                if include["t_ins"].get():
+                    story.append(Paragraph("2.3.2. Instrument", styles["SU_H3_10"]))
+                    story.append(
+                        ListFlowable(
+                            [Paragraph(x, styles["SU_Body10_H3"]) for x in r.methods_instruments],
+                            bulletType="bullet"
+                        )
+                    )
+                if include["t_proc"].get():
+                    story.append(Paragraph("2.3.3. Experimental Procedure", styles["SU_H3_10"]))
+                    story.append(
+                        ListFlowable(
+                            [Paragraph(x, styles["SU_Body10_H3"]) for x in r.methods_procedure],
+                            bulletType="bullet"
+                        )
+                    )
+                if include["t_trial"].get():
+                    story.append(Paragraph("2.3.4. Trial History", styles["SU_H3_10"]))
+                    story.append(Spacer(1, 6))
+                    if r.trial_history:
+                        data_th = [["Trial#", "Issue", "Possible Reasons"]] + [
+                            [t.number, t.issue, t.reasons] for t in r.trial_history
+                        ]
+                        tt = Table(data_th, colWidths=[1.0 * inch, 2.0 * inch, 4.0 * inch])
+                        tt.setStyle(TableStyle([
+                            ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                            ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ]))
+                        story.append(tt)
+
+            if include["t_results"].get():
+                story.append(Paragraph("2.4. Results", styles["SU_H2_11"]))
+                for i, it in enumerate(r.results, 1):
+                    if it.kind == "text":
+                        story.append(Paragraph(f"2.4.{i}. {it.title}", styles["SU_H3_10"]))
+                        story.append(Paragraph((it.content or "").replace("\n", "<br/>"), styles["SU_Body10_H3"]))
+                    elif it.kind == "table":
+                        story.append(Paragraph(f"{it.title}", styles["SU_H3_10"]))
+                        data = it.table_data if it.table_data else parse_table_text(it.content)
+                        if data:
+                            ncols = max(len(rw) for rw in data)
+                            total_w = 7.0 * inch
+                            col_w = [total_w / max(1, ncols)] * ncols
+                            tbl = Table(data, colWidths=col_w)
+                            tbl.setStyle(TableStyle([
+                                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                                ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+                                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                            ]))
+                            story.append(tbl)
+                        else:
+                            story.append(Paragraph((it.content or "").replace("\n", "<br/>"), styles["SU_Body10_H3"]))
+                    elif it.kind == "image":
+                        imgs = it.images if it.images else ([it.image_path] if it.image_path else [])
+                        if imgs:
+                            if it.title:
+                                story.append(Paragraph(f"{it.title}", styles["SU_H3_10"]))
+                            for pth in imgs:
+                                if pth and os.path.isfile(pth):
+                                    story.append(RLImage(pth, width=5.8 * inch, height=3.3 * inch))
+                                    if it.caption:
+                                        story.append(Paragraph(it.caption, styles["SU_Body10_H3"]))
+
+            if include["t_conc"].get():
+                story.append(Paragraph("2.5. Conclusion", styles["SU_H2_11"]))
+                story.append(
+                    ListFlowable(
+                        [Paragraph(x, styles["SU_Body10_H2"]) for x in r.conclusion],
+                        bulletType="bullet"
+                    )
+                )
+
+            if include["t_refs"].get():
+                story.append(Paragraph("2.6. References", styles["SU_H2_11"]))
+                story.append(
+                    ListFlowable(
+                        [Paragraph(x, styles["SU_Body10_H2"]) for x in r.references],
+                        bulletType="bullet"
+                    )
+                )
+
+            if include["t_misc"].get():
+                story.append(Paragraph("2.7. Miscellaneous", styles["SU_H2_11"]))
+                for i, m in enumerate(r.miscellaneous_items, 1):
+                    story.append(Paragraph(f"2.7.{i}. {m.title}", styles["SU_H3_10"]))
+                    story.append(Paragraph((m.content or "").replace("\n", "<br/>"), styles["SU_Body10_H3"]))
+
+        # 3. Scale Up (renumbered)
+        if include["sec_scale"].get():
+            story.append(Paragraph("3. Scale Up", styles["SU_H1_12"]))
+            if include["s_41"].get():
+                story.append(Paragraph("3.1. Manufacturing Order", styles["SU_H2_11"]))
+                if r.manuf_order_steps:
+                    story.append(
+                        ListFlowable(
+                            [Paragraph(x, styles["SU_Body10_H2"]) for x in r.manuf_order_steps],
+                            bulletType="bullet"
+                        )
+                    )
+            if include["s_42"].get():
+                story.append(Paragraph("3.2. Formulation Risk", styles["SU_H2_11"]))
+                story.append(Paragraph((r.formulation_risk_text or "").replace("\n", "<br/>"), styles["SU_Body10_H2"]))
+            if include["s_43"].get():
+                story.append(Paragraph("3.3. Hazards", styles["SU_H2_11"]))
+                story.append(Paragraph((r.hazards_text or "").replace("\n", "<br/>"), styles["SU_Body10_H2"]))
+            if include["s_44"].get():
+                story.append(Paragraph("3.4. Equipment", styles["SU_H2_11"]))
+                story.append(Paragraph((r.equipment_text or "").replace("\n", "<br/>"), styles["SU_Body10_H2"]))
+            if include["s_45"].get():
+                story.append(Paragraph("3.5. CAPEX Requirements", styles["SU_H2_11"]))
+                story.append(Paragraph((r.capex_text or "").replace("\n", "<br/>"), styles["SU_Body10_H2"]))
+            if include["s_46"].get():
+                story.append(Paragraph("3.6. Safety Assessment", styles["SU_H2_11"]))
+                story.append(Paragraph((r.safety_assess_text or "").replace("\n", "<br/>"), styles["SU_Body10_H2"]))
+
+        def on_page(canvas, doc_obj):
+            if header_img and os.path.isfile(header_img):
+                try:
+                    canvas.drawImage(
+                        header_img,
+                        x=doc_obj.leftMargin,
+                        y=doc_obj.pagesize[1] - 0.85 * inch,
+                        width=doc_obj.width,
+                        height=0.5 * inch,
+                        preserveAspectRatio=True,
+                        mask="auto",
+                    )
+                except Exception:
+                    pass
+
+            if footer_img and os.path.isfile(footer_img):
+                try:
+                    canvas.drawImage(
+                        footer_img,
+                        x=doc_obj.leftMargin,
+                        y=0.35 * inch,
+                        width=doc_obj.width,
+                        height=0.5 * inch,
+                        preserveAspectRatio=True,
+                        mask="auto",
+                    )
+                except Exception:
+                    pass
+
+            page_num = canvas.getPageNumber()
+            canvas.setFont("Helvetica", 9)
+            canvas.drawRightString(doc_obj.pagesize[0] - doc_obj.rightMargin, 0.25 * inch, f"{page_num}")
+
+        doc = SimpleDocTemplate(
+            out_path,
+            pagesize=A4,
+            leftMargin=0.75 * inch,
+            rightMargin=0.75 * inch,
+            topMargin=1.35 * inch,
+            bottomMargin=1.2 * inch,
+        )
+        doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
+        messagebox.showinfo("PDF saved", f"Saved: {out_path}")
+
+    # ------------------------------- Generate -------------------------------
     def _generate(self):
         r = self._collect()
         if not r.project_title:
             messagebox.showwarning("Missing title", "Please enter a Project Title in General Information.")
             return
 
+        # Determine whether the custom Scale Up Report is requested.
+        # This assumes self.custom_scaleup_var is defined in _tab_export;
+        # if not present, we default to False so existing projects still work.
+        try:
+            custom_scaleup = bool(getattr(self, "custom_scaleup_var", None).get())
+        except Exception:
+            custom_scaleup = False
+
         out_dir = self.out_dir_var.get().strip()
         ensure_dir(os.path.join(out_dir, "_"))
+
         base = f"{r.project_title.strip().replace(os.sep, '_')}_{datetime.date.today().isoformat()}"
         docx_path = os.path.join(out_dir, base + ".docx")
         pdf_path = os.path.join(out_dir, base + ".pdf")
+
+        # Paths for the custom manufacturing-focused Scale Up report
+        scale_docx_path = os.path.join(out_dir, base + "_ScaleUp.docx")
+        scale_pdf_path = os.path.join(out_dir, base + "_ScaleUp.pdf")
+
         want = self.export_fmt.get()
         header_img = self.header_path_var.get().strip() if os.path.isfile(self.header_path_var.get().strip()) else None
         footer_img = self.footer_path_var.get().strip() if os.path.isfile(self.footer_path_var.get().strip()) else None
 
+        # ----------------- Full report generation -----------------
         if want in ("docx", "both"):
             if Document is None:
                 messagebox.showerror("python-docx not found", "Install python-docx to export .docx")
@@ -2340,6 +2972,7 @@ class ReportApp(tk.Tk):
             messagebox.showinfo("DOCX saved", f"Saved: {docx_path}")
 
         if want in ("pdf", "both"):
+            # Prefer docx2pdf pipeline if available and full DOCX exists
             if docx2pdf_convert and os.path.isfile(docx_path):
                 try:
                     docx2pdf_convert(docx_path, pdf_path)
@@ -2348,6 +2981,26 @@ class ReportApp(tk.Tk):
                     self._export_pdf_basic(r, pdf_path, header_img, footer_img)
             else:
                 self._export_pdf_basic(r, pdf_path, header_img, footer_img)
+
+        # ----------------- Custom Scale Up Report generation -----------------
+        if custom_scaleup:
+            # DOCX for Scale Up
+            if want in ("docx", "both"):
+                if Document is None:
+                    messagebox.showerror("python-docx not found", "Install python-docx to export Scale Up DOCX")
+                else:
+                    self._export_docx_scaleup(r, scale_docx_path, header_img, footer_img)
+                    messagebox.showinfo("Scale Up DOCX saved", f"Saved: {scale_docx_path}")
+
+            if want in ("pdf", "both"):
+                if docx2pdf_convert and os.path.isfile(scale_docx_path):
+                    try:
+                        docx2pdf_convert(scale_docx_path, scale_pdf_path)
+                        messagebox.showinfo("Scale Up PDF saved", f"Saved: {scale_pdf_path}")
+                    except Exception:
+                        self._export_pdf_scaleup(r, scale_pdf_path, header_img, footer_img)
+                else:
+                    self._export_pdf_scaleup(r, scale_pdf_path, header_img, footer_img)
 
 # ------------------------------ Entrypoint -----------------------------------
 if __name__ == "__main__":
